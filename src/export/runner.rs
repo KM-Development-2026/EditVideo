@@ -350,7 +350,7 @@ fn for_each_line(r: impl Read, mut f: impl FnMut(&str)) {
 }
 
 /// 最後の n 行を保持しつつ最後まで読む
-fn read_tail(r: impl Read, n: usize) -> Vec<String> {
+pub(crate) fn read_tail(r: impl Read, n: usize) -> Vec<String> {
     let mut lines = VecDeque::with_capacity(n);
     for_each_line(r, |line| {
         if line.is_empty() {

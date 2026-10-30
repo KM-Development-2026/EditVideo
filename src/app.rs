@@ -6,12 +6,15 @@ use std::time::Duration;
 
 use eframe::egui;
 
+use crate::export::command::secs_string;
 use crate::export::{ExportEvent, ExportJob, ExportMode, ExportSettings, Quality};
 use crate::media::ffmpeg::{self, FfmpegPaths};
+use crate::media::player::{PlaybackState, Player, PlayerCommand, PlayerEvent};
 use crate::media::probe;
 use crate::model::history::History;
-use crate::model::timeline::Timeline;
+use crate::model::timeline::{Segment, Timeline};
 use crate::model::{MediaInfo, Timestamp};
+use crate::ui::preview::Preview;
 
 /// 対応する拡張子（ファイル選択ダイアログのフィルタ）
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -50,6 +53,16 @@ pub struct EditVideoApp {
     export: Option<RunningExport>,
     /// 書き出し結果（Ok = 完了メッセージ, Err = 失敗メッセージ）
     export_result: Option<Result<String, String>>,
+    player: Option<Player>,
+    /// プレイヤーに渡したタイムラインのセグメント（変更検出用）
+    player_segments: Vec<Segment>,
+    preview: Preview,
+    /// 表示中フレームのタイムライン時刻（再生ヘッド）
+    position: Timestamp,
+    playing: bool,
+    /// シークスライダー操作中の値（秒）。フレームが届くまで表示に使う
+    scrub: Option<f64>,
+    scrub_dragging: bool,
 }
 
 impl EditVideoApp {
@@ -67,6 +80,13 @@ impl EditVideoApp {
             export_dialog: None,
             export: None,
             export_result: None,
+            player: None,
+            player_segments: Vec::new(),
+            preview: Preview::default(),
+            position: Timestamp::ZERO,
+            playing: false,
+            scrub: None,
+            scrub_dragging: false,
         }
     }
 
@@ -102,7 +122,7 @@ impl EditVideoApp {
         self.error = None;
     }
 
-    fn poll_probe(&mut self) {
+    fn poll_probe(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.probing else { return };
         match rx.try_recv() {
             Ok((path, result)) => {
@@ -117,6 +137,7 @@ impl EditVideoApp {
                         self.in_text.clear();
                         self.out_text.clear();
                         self.error = None;
+                        self.start_player(ctx);
                     }
                     Err(e) => {
                         self.error = Some(format!("{} を開けません: {e}", path.display()));
@@ -129,6 +150,174 @@ impl EditVideoApp {
                 self.error = Some("ffprobe の実行スレッドが異常終了しました".into());
             }
         }
+    }
+
+    /// 現在のタイムラインでプレイヤーを作り直し、先頭フレームを表示する
+    fn start_player(&mut self, ctx: &egui::Context) {
+        // 既存プレイヤーは先に止める（ffmpeg を終了させる）
+        self.player = None;
+        self.preview.clear();
+        self.position = Timestamp::ZERO;
+        self.playing = false;
+        self.scrub = None;
+        let ffmpeg = match &self.ffmpeg {
+            Ok(p) => p.ffmpeg.clone(),
+            Err(e) => {
+                self.error = Some(e.clone());
+                return;
+            }
+        };
+        let notify_ctx = ctx.clone();
+        match Player::start(&ffmpeg, self.timeline.clone(), move || {
+            notify_ctx.request_repaint()
+        }) {
+            Ok(player) => {
+                player.seek(Timestamp::ZERO);
+                self.player = Some(player);
+                self.player_segments = self.timeline.segments.clone();
+            }
+            Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+
+    fn send_player(&self, cmd: PlayerCommand) {
+        if let Some(p) = &self.player {
+            p.send(cmd);
+        }
+    }
+
+    fn toggle_play(&self) {
+        self.send_player(if self.playing {
+            PlayerCommand::Pause
+        } else {
+            PlayerCommand::Play
+        });
+    }
+
+    /// タイムライン（セグメント構成）が変わったらプレイヤーへスナップショットを送る。
+    /// IN/OUT は再生に影響しないので対象外
+    fn sync_player_timeline(&mut self) {
+        let Some(player) = &self.player else { return };
+        if self.player_segments != self.timeline.segments {
+            player.set_timeline(self.timeline.clone());
+            self.player_segments = self.timeline.segments.clone();
+        }
+    }
+
+    fn poll_player(&mut self, ctx: &egui::Context) {
+        let Some(player) = &self.player else { return };
+        // 複数届いていても表示するのは最新のフレームだけ
+        let mut latest = None;
+        while let Some(ev) = player.try_recv() {
+            match ev {
+                PlayerEvent::Frame {
+                    time,
+                    width,
+                    height,
+                    rgba,
+                } => latest = Some((time, width, height, rgba)),
+                PlayerEvent::State(s) => self.playing = s == PlaybackState::Playing,
+                PlayerEvent::Ended => self.playing = false,
+                PlayerEvent::Error(e) => self.error = Some(e),
+            }
+        }
+        if let Some((time, width, height, rgba)) = latest {
+            self.preview.set_frame(ctx, time, width, height, &rgba);
+            self.position = time;
+            if !self.scrub_dragging {
+                self.scrub = None;
+            }
+        }
+    }
+
+    /// Space / ← / →（テキスト入力中は無効）。本格的なキーマップは後続ステップ
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if self.player.is_none() || ctx.text_edit_focused() {
+            return;
+        }
+        let none = egui::Modifiers::NONE;
+        let (space, left, right) = ctx.input_mut(|i| {
+            (
+                i.consume_key(none, egui::Key::Space),
+                i.consume_key(none, egui::Key::ArrowLeft),
+                i.consume_key(none, egui::Key::ArrowRight),
+            )
+        });
+        if space {
+            self.toggle_play();
+        }
+        if left {
+            self.send_player(PlayerCommand::StepFrame(-1));
+        }
+        if right {
+            self.send_player(PlayerCommand::StepFrame(1));
+        }
+    }
+
+    /// 簡易トランスポート（先頭・コマ送り・再生/停止・末尾・時刻・シークスライダー）
+    fn transport(&mut self, ui: &mut egui::Ui) {
+        if self.player.is_none() {
+            return;
+        }
+        let duration = self.timeline.duration();
+        ui.horizontal(|ui| {
+            if ui.button("|◀").on_hover_text("先頭へ").clicked() {
+                self.send_player(PlayerCommand::Seek(Timestamp::ZERO));
+            }
+            if ui.button("◀").on_hover_text("1フレーム戻る (←)").clicked() {
+                self.send_player(PlayerCommand::StepFrame(-1));
+            }
+            let label = if self.playing { "‖" } else { "▶" };
+            if ui
+                .add(egui::Button::new(label).min_size(egui::vec2(36.0, 0.0)))
+                .on_hover_text("再生 / 一時停止 (Space)")
+                .clicked()
+            {
+                self.toggle_play();
+            }
+            if ui.button("▶").on_hover_text("1フレーム進む (→)").clicked() {
+                self.send_player(PlayerCommand::StepFrame(1));
+            }
+            if ui.button("▶|").on_hover_text("末尾へ").clicked() {
+                self.send_player(PlayerCommand::Seek(duration));
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} / {}",
+                    self.position.to_hms(),
+                    duration.to_hms()
+                ))
+                .monospace(),
+            );
+            ui.separator();
+            if ui.button("現在位置を IN に").clicked() {
+                self.timeline.set_in(self.position);
+                self.refresh_in_out_text();
+            }
+            if ui.button("現在位置を OUT に").clicked() {
+                self.timeline.set_out(self.position);
+                self.refresh_in_out_text();
+            }
+        });
+        ui.scope(|ui| {
+            ui.spacing_mut().slider_width = ui.available_width();
+            let mut secs = self.scrub.unwrap_or_else(|| self.position.as_secs_f64());
+            let resp = ui
+                .add(egui::Slider::new(&mut secs, 0.0..=duration.as_secs_f64()).show_value(false));
+            // ドラッグ中も Seek を送る（スクラブ。古い要求はプレイヤー側で破棄される）
+            if resp.changed() {
+                self.scrub = Some(secs);
+                self.send_player(PlayerCommand::Seek(Timestamp((secs * 1e6).round() as i64)));
+            }
+            self.scrub_dragging = resp.dragged();
+        });
+    }
+
+    /// IN/OUT 入力欄を現在の IN/OUT 点に合わせる
+    fn refresh_in_out_text(&mut self) {
+        let text = |t: Option<Timestamp>| t.map(secs_string).unwrap_or_default();
+        self.in_text = text(self.timeline.in_point);
+        self.out_text = text(self.timeline.out_point);
     }
 
     fn can_export(&self) -> bool {
@@ -241,26 +430,21 @@ impl EditVideoApp {
             ui.label("「開く」(Ctrl+O) で動画ファイルを選択してください。");
             return;
         };
-        egui::Grid::new("media_info")
-            .num_columns(2)
-            .spacing([16.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("パス");
-                ui.label(info.path.display().to_string());
-                ui.end_row();
-                ui.label("長さ");
-                ui.label(info.duration.to_hms());
-                ui.end_row();
-                ui.label("解像度");
-                ui.label(format!("{} × {}", info.width, info.height));
-                ui.end_row();
-                ui.label("fps");
-                ui.label(format!("{:.3} ({})", info.fps.as_f64(), info.fps));
-                ui.end_row();
-                ui.label("音声");
-                ui.label(if info.has_audio { "あり" } else { "なし" });
-                ui.end_row();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(info.path.display().to_string());
+            ui.separator();
+            ui.label(format!("長さ {}", info.duration.to_hms()));
+            ui.separator();
+            ui.label(format!("{} × {}", info.width, info.height));
+            ui.separator();
+            ui.label(format!("{:.3} fps ({})", info.fps.as_f64(), info.fps));
+            ui.separator();
+            ui.label(if info.has_audio {
+                "音声あり"
+            } else {
+                "音声なし"
             });
+        });
         ui.separator();
         self.in_out_editor(ui);
     }
@@ -417,8 +601,12 @@ fn parse_secs(s: &str) -> Result<Option<Timestamp>, ()> {
 
 impl eframe::App for EditVideoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_probe();
+        let ctx = ui.ctx().clone();
+        self.poll_probe(&ctx);
         self.poll_export();
+        self.sync_player_timeline();
+        self.poll_player(&ctx);
+        self.handle_keys(&ctx);
 
         let open_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         if ui.ctx().input_mut(|i| i.consume_shortcut(&open_shortcut)) {
@@ -442,9 +630,19 @@ impl eframe::App for EditVideoApp {
             });
         }
 
-        egui::CentralPanel::default().show(ui, |ui| self.media_info(ui));
+        if self.timeline.sources.is_empty() {
+            egui::CentralPanel::default().show(ui, |ui| self.media_info(ui));
+        } else {
+            egui::Panel::bottom("controls").show(ui, |ui| {
+                ui.add_space(4.0);
+                self.transport(ui);
+                ui.separator();
+                self.media_info(ui);
+                ui.add_space(4.0);
+            });
+            egui::CentralPanel::default().show(ui, |ui| self.preview.show(ui));
+        }
 
-        let ctx = ui.ctx().clone();
         self.export_windows(&ctx);
     }
 }

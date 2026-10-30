@@ -1,76 +1,19 @@
 //! ffmpeg で生成したテスト動画を実際に書き出して尺を検証する（ffmpeg が無ければスキップ）
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::process::Command;
 
+use common::{TestDir, make_video, open, tools};
 use edit_video::export::{ExportEvent, ExportJob, ExportMode, ExportSettings, Quality};
-use edit_video::media::ffmpeg::{self, FfmpegPaths};
+use edit_video::media::ffmpeg::FfmpegPaths;
 use edit_video::media::probe;
 use edit_video::model::Timestamp;
 use edit_video::model::timeline::Timeline;
 
 /// 30fps の1フレーム
 const FRAME_US: i64 = 33_334;
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("edit_video_it_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        TestDir(dir)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn tools() -> Option<FfmpegPaths> {
-    match ffmpeg::locate() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("ffmpeg が見つからないためスキップ: {e:#}");
-            None
-        }
-    }
-}
-
-/// testsrc2（+ sine）から動画を作る。キーフレームは1秒ごと
-fn make_video(ff: &FfmpegPaths, out: &Path, size: &str, rate: u32, secs: u32, audio: bool) {
-    let mut cmd = Command::new(&ff.ffmpeg);
-    cmd.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-    ])
-    .arg(format!("testsrc2=size={size}:rate={rate}:duration={secs}"));
-    if audio {
-        cmd.args(["-f", "lavfi", "-i"])
-            .arg(format!("sine=frequency=440:duration={secs}"));
-    }
-    cmd.args([
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-pix_fmt",
-        "yuv420p",
-    ])
-    .args(["-g", &rate.to_string()]);
-    if audio {
-        cmd.args(["-c:a", "aac"]);
-    }
-    let status = cmd.arg(out).status().expect("ffmpeg を起動できません");
-    assert!(status.success(), "テスト動画の生成に失敗");
-}
 
 /// ffprobe で映像ストリームの尺を得る
 fn video_duration(ff: &FfmpegPaths, file: &Path) -> Timestamp {
@@ -86,14 +29,6 @@ fn video_duration(ff: &FfmpegPaths, file: &Path) -> Timestamp {
         .parse()
         .unwrap_or_else(|_| panic!("尺を読めません: {s:?}"));
     Timestamp((secs * 1e6).round() as i64)
-}
-
-fn open(ff: &FfmpegPaths, files: &[&Path]) -> Timeline {
-    let mut tl = Timeline::new();
-    for f in files {
-        tl.add_source(probe::probe(&ff.ffprobe, f).unwrap());
-    }
-    tl
 }
 
 fn export(ff: &FfmpegPaths, tl: &Timeline, mode: ExportMode, output: &Path) -> Vec<f32> {
