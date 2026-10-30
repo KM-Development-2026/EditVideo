@@ -1,4 +1,6 @@
-//! UI 部品（タイムライン・書き出しダイアログ・キーマップは後続ステップで実装）
+//! UI 部品
 
+pub mod keymap;
 pub mod preview;
+pub mod timeline;
 pub mod transport;

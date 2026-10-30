@@ -1,12 +1,12 @@
 //! アプリ状態と画面描画
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use eframe::egui;
 
-use crate::export::command::secs_string;
 use crate::export::{ExportEvent, ExportJob, ExportMode, ExportSettings, Quality};
 use crate::media::ffmpeg::{self, FfmpegPaths};
 use crate::media::player::{PlaybackState, Player, PlayerCommand, PlayerEvent};
@@ -14,21 +14,10 @@ use crate::media::probe;
 use crate::model::history::History;
 use crate::model::timeline::{Segment, Timeline};
 use crate::model::{MediaInfo, Timestamp};
+use crate::ui::keymap::{self, Action};
 use crate::ui::preview::Preview;
+use crate::ui::timeline::{self, TimelineEvent, TimelineView, Tool};
 use crate::ui::transport::{self, Icon};
-
-/// トランスポート操作
-#[derive(Clone, Copy)]
-enum TransportAction {
-    MarkIn,
-    MarkOut,
-    GoToIn,
-    GoToOut,
-    GoToStart,
-    GoToEnd,
-    Step(i64),
-    TogglePlay,
-}
 
 /// 対応する拡張子（ファイル選択ダイアログのフィルタ）
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -60,9 +49,10 @@ pub struct EditVideoApp {
     error: Option<String>,
     /// ffprobe 実行中の結果受信
     probing: Option<Receiver<ProbeResult>>,
-    /// IN/OUT 入力欄（秒）
-    in_text: String,
-    out_text: String,
+    /// 選択中のセグメント番号
+    selection: BTreeSet<usize>,
+    tool: Tool,
+    timeline_view: TimelineView,
     export_dialog: Option<ExportDialog>,
     export: Option<RunningExport>,
     /// 書き出し結果（Ok = 完了メッセージ, Err = 失敗メッセージ）
@@ -98,8 +88,9 @@ impl EditVideoApp {
             history: History::new(),
             error,
             probing: None,
-            in_text: String::new(),
-            out_text: String::new(),
+            selection: BTreeSet::new(),
+            tool: Tool::default(),
+            timeline_view: TimelineView::default(),
             export_dialog: None,
             export: None,
             export_result: None,
@@ -160,8 +151,8 @@ impl EditVideoApp {
                         tl.add_source(info);
                         self.timeline = tl;
                         self.history.clear();
-                        self.in_text.clear();
-                        self.out_text.clear();
+                        self.selection.clear();
+                        self.timeline_view = TimelineView::default();
                         self.error = None;
                         self.start_player(ctx);
                     }
@@ -256,61 +247,277 @@ impl EditVideoApp {
         }
     }
 
-    /// トランスポート系のキー（Premiere Pro 準拠。テキスト入力中は無効）。
-    /// 本格的なキーマップは後続ステップ
+    /// ショートカット（`ui::keymap`）。テキスト入力中は無効
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.player.is_none() || ctx.text_edit_focused() {
+        if ctx.text_edit_focused() {
             return;
         }
-        use egui::{Key, Modifiers};
-        // consume_key は余分な Shift を無視して一致するので、Shift 付きを先に判定する
-        let bindings = [
-            (Modifiers::SHIFT, Key::ArrowLeft, TransportAction::Step(-5)),
-            (Modifiers::SHIFT, Key::ArrowRight, TransportAction::Step(5)),
-            (Modifiers::SHIFT, Key::I, TransportAction::GoToIn),
-            (Modifiers::SHIFT, Key::O, TransportAction::GoToOut),
-            (Modifiers::NONE, Key::Space, TransportAction::TogglePlay),
-            (Modifiers::NONE, Key::ArrowLeft, TransportAction::Step(-1)),
-            (Modifiers::NONE, Key::ArrowRight, TransportAction::Step(1)),
-            (Modifiers::NONE, Key::I, TransportAction::MarkIn),
-            (Modifiers::NONE, Key::O, TransportAction::MarkOut),
-            (Modifiers::NONE, Key::Home, TransportAction::GoToStart),
-            (Modifiers::NONE, Key::End, TransportAction::GoToEnd),
-        ];
-        let actions: Vec<_> = ctx.input_mut(|i| {
-            bindings
-                .iter()
-                .filter(|(m, k, _)| i.consume_key(*m, *k))
-                .map(|(_, _, a)| *a)
-                .collect()
+        let (actions, k_held) = ctx.input_mut(|i| {
+            (
+                keymap::take_actions(&mut i.events),
+                i.key_down(egui::Key::K),
+            )
         });
         for a in actions {
-            self.run_transport(a);
+            // K 押しながら L / J はコマ送り
+            let a = match a {
+                Action::ShuttleRight if k_held => Action::Step(1),
+                Action::ShuttleLeft if k_held => Action::Step(-1),
+                a => a,
+            };
+            self.run_action(ctx, a);
         }
     }
 
-    fn run_transport(&mut self, action: TransportAction) {
+    /// 時刻のタイムコード表示（MVP は素材1件なので先頭素材の fps を使う）
+    fn timecode(&self, t: Timestamp) -> String {
+        match self.timeline.sources.first() {
+            Some(src) => src.fps.timecode(t),
+            None => t.to_hms(),
+        }
+    }
+
+    /// 再生ヘッドの表示位置（スクラブ中は操作中の値）
+    fn display_position(&self) -> Timestamp {
+        self.scrub
+            .map_or(self.position, |s| Timestamp((s * 1e6).round() as i64))
+    }
+
+    fn seek(&self, t: Timestamp) {
+        self.send_player(PlayerCommand::Seek(t));
+    }
+
+    /// 編集操作を履歴付きで適用する。セグメントの並びが変わったら選択を解除する
+    fn edit(&mut self, f: impl FnOnce(&mut Timeline) -> bool) -> bool {
+        let count = self.timeline.segments.len();
+        let changed = self.history.apply(&mut self.timeline, f);
+        if changed && self.timeline.segments.len() != count {
+            self.selection.clear();
+        }
+        changed
+    }
+
+    /// IN/OUT 点の変更を履歴付きで適用する
+    fn edit_marks(&mut self, f: impl FnOnce(&mut Timeline)) {
+        self.edit(|tl| {
+            let before = (tl.in_point, tl.out_point);
+            f(tl);
+            before != (tl.in_point, tl.out_point)
+        });
+    }
+
+    /// 選択中の各セグメントに f を適用する
+    fn edit_selected(&mut self, f: impl Fn(&mut Timeline, usize) -> bool) {
+        let selection: Vec<usize> = self.selection.iter().copied().collect();
+        self.edit(|tl| selection.iter().fold(false, |acc, &i| f(tl, i) | acc));
+    }
+
+    fn undo_redo(&mut self, redo: bool) {
+        let count = self.timeline.segments.len();
+        let done = if redo {
+            self.history.redo(&mut self.timeline)
+        } else {
+            self.history.undo(&mut self.timeline)
+        };
+        if done && self.timeline.segments.len() != count {
+            self.selection.clear();
+        }
+    }
+
+    fn run_action(&mut self, ctx: &egui::Context, action: Action) {
+        // 動画を開く前に使えるのはファイル操作だけ
+        if self.player.is_none() && !matches!(action, Action::Open | Action::Export) {
+            return;
+        }
         let duration = self.timeline.duration();
+        let pos = self.position;
         match action {
-            TransportAction::MarkIn => {
-                self.timeline.set_in(self.position);
-                self.refresh_in_out_text();
+            Action::TogglePlay => self.toggle_play(),
+            Action::ShuttleRight => self.send_player(PlayerCommand::Play),
+            Action::ShuttleStop => self.send_player(PlayerCommand::Pause),
+            // 逆再生は後続ステップ
+            Action::ShuttleLeft => {}
+            Action::Step(n) => self.send_player(PlayerCommand::StepFrame(n)),
+            Action::PrevEdit => {
+                if let Some(t) = self.timeline.prev_edit(pos) {
+                    self.seek(t);
+                }
             }
-            TransportAction::MarkOut => {
-                self.timeline.set_out(self.position);
-                self.refresh_in_out_text();
+            Action::NextEdit => {
+                if let Some(t) = self.timeline.next_edit(pos) {
+                    self.seek(t);
+                }
             }
+            Action::GoToStart => self.seek(Timestamp::ZERO),
+            Action::GoToEnd => self.seek(duration),
             // IN/OUT 未設定なら先頭/末尾へ（Premiere と同じ）
-            TransportAction::GoToIn => self.send_player(PlayerCommand::Seek(
-                self.timeline.in_point.unwrap_or(Timestamp::ZERO),
-            )),
-            TransportAction::GoToOut => self.send_player(PlayerCommand::Seek(
-                self.timeline.out_point.unwrap_or(duration),
-            )),
-            TransportAction::GoToStart => self.send_player(PlayerCommand::Seek(Timestamp::ZERO)),
-            TransportAction::GoToEnd => self.send_player(PlayerCommand::Seek(duration)),
-            TransportAction::Step(n) => self.send_player(PlayerCommand::StepFrame(n)),
-            TransportAction::TogglePlay => self.toggle_play(),
+            Action::GoToIn => self.seek(self.timeline.in_point.unwrap_or(Timestamp::ZERO)),
+            Action::GoToOut => self.seek(self.timeline.out_point.unwrap_or(duration)),
+            Action::MarkIn => self.edit_marks(|tl| tl.set_in(pos)),
+            Action::MarkOut => self.edit_marks(|tl| tl.set_out(pos)),
+            Action::ClearIn => self.edit_marks(Timeline::clear_in),
+            Action::ClearOut => self.edit_marks(Timeline::clear_out),
+            Action::ClearInOut => self.edit_marks(Timeline::clear_in_out),
+            Action::MarkClip => {
+                let range = self
+                    .timeline
+                    .locate(pos)
+                    .and_then(|(i, _)| self.timeline.segment_range(i));
+                if let Some((a, b)) = range {
+                    self.edit_marks(|tl| {
+                        tl.clear_in_out();
+                        tl.set_in(a);
+                        tl.set_out(b);
+                    });
+                }
+            }
+            Action::Split => {
+                self.edit(|tl| tl.split_at(pos));
+            }
+            Action::DeleteSelected => self.edit_selected(Timeline::delete),
+            Action::ToggleSelected => self.edit_selected(Timeline::toggle),
+            Action::DeleteInOut => {
+                if let Some((a, b)) = self.timeline.in_out_range() {
+                    self.edit(|tl| tl.delete_range(a, b));
+                }
+            }
+            Action::TrimPrev => {
+                if let Some(a) = self.timeline.prev_edit(pos) {
+                    self.edit(|tl| tl.delete_range(a, pos));
+                }
+            }
+            Action::TrimNext => {
+                if let Some(b) = self.timeline.next_edit(pos) {
+                    self.edit(|tl| tl.delete_range(pos, b));
+                }
+            }
+            Action::SelectAll => self.selection = (0..self.timeline.segments.len()).collect(),
+            Action::DeselectAll => self.selection.clear(),
+            Action::Undo => self.undo_redo(false),
+            Action::Redo => self.undo_redo(true),
+            Action::SelectTool => self.tool = Tool::Select,
+            Action::RazorTool => self.tool = Tool::Razor,
+            // キー操作のズームは再生ヘッドを基準にする（Premiere と同じ）
+            Action::ZoomIn => self
+                .timeline_view
+                .zoom_in(&self.timeline, pos.as_secs_f64()),
+            Action::ZoomOut => self
+                .timeline_view
+                .zoom_out(&self.timeline, pos.as_secs_f64()),
+            Action::ZoomFit => self.timeline_view.zoom_fit(),
+            Action::Open => self.open_dialog(ctx),
+            Action::Export => self.export_dialog_open(),
+        }
+    }
+
+    fn timeline_panel(&mut self, ui: &mut egui::Ui) {
+        let events = self.timeline_view.show(
+            ui,
+            &self.timeline,
+            self.display_position(),
+            &self.selection,
+            self.tool,
+        );
+        for ev in events {
+            match ev {
+                TimelineEvent::Seek(t) => {
+                    self.scrub = Some(t.as_secs_f64());
+                    self.seek(t);
+                }
+                TimelineEvent::Select { idx, add } => match (idx, add) {
+                    (Some(i), true) => {
+                        if !self.selection.remove(&i) {
+                            self.selection.insert(i);
+                        }
+                    }
+                    (Some(i), false) => self.selection = BTreeSet::from([i]),
+                    (None, true) => {}
+                    (None, false) => self.selection.clear(),
+                },
+                TimelineEvent::Split(t) => {
+                    let t = self.timeline.snap_to_frame(t);
+                    self.edit(|tl| tl.split_at(t));
+                }
+            }
+        }
+        // シークバーとタイムラインのどちらかでドラッグ中ならスクラブ扱い
+        self.scrub_dragging |= self.timeline_view.dragging();
+    }
+
+    /// 選択中のセグメント・ツール・IN/OUT・書き出し対象の表示と編集ボタン
+    fn edit_bar(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
+        ui.horizontal(|ui| {
+            for (tool, label, tip) in [
+                (Tool::Select, "選択", "選択ツール (V)"),
+                (Tool::Razor, "レーザー", "レーザーツール (C)"),
+            ] {
+                if ui
+                    .selectable_label(self.tool == tool, label)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    self.tool = tool;
+                }
+            }
+            ui.separator();
+            let selected = match self.selection.len() {
+                0 => "選択: なし".to_owned(),
+                1 => {
+                    let i = *self.selection.first().unwrap();
+                    let (a, b) = self.timeline.segment_range(i).unwrap_or_default();
+                    format!(
+                        "選択: セグメント{} {}–{}",
+                        i + 1,
+                        self.timecode(a),
+                        self.timecode(b)
+                    )
+                }
+                n => format!("選択: {n} セグメント"),
+            };
+            ui.label(selected);
+            let has_sel = !self.selection.is_empty();
+            let buttons = [
+                ("分割", "再生位置で分割 (Ctrl+K)", true, Action::Split),
+                (
+                    "削除",
+                    "選択セグメントを削除 (Delete)",
+                    has_sel,
+                    Action::DeleteSelected,
+                ),
+            ];
+            for (label, tip, enabled, a) in buttons {
+                if ui
+                    .add_enabled(enabled, egui::Button::new(label))
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    action = Some(a);
+                }
+            }
+            if ui
+                .add_enabled(has_sel, egui::Button::new("復元"))
+                .on_hover_text("選択セグメントを復元（有効/無効の切り替えは Shift+E）")
+                .clicked()
+            {
+                self.edit_selected(Timeline::restore);
+            }
+            ui.separator();
+            let fmt = |t: Option<Timestamp>| t.map_or("—".to_owned(), |t| self.timecode(t));
+            let ranges = self.timeline.export_ranges();
+            let total = ranges
+                .iter()
+                .fold(Timestamp::ZERO, |acc, r| acc + (r.end - r.start));
+            ui.label(format!(
+                "IN {} / OUT {}　書き出し対象: {} 区間・{}",
+                fmt(self.timeline.in_point),
+                fmt(self.timeline.out_point),
+                ranges.len(),
+                self.timecode(total)
+            ));
+        });
+        if let Some(a) = action {
+            self.run_action(ui.ctx(), a);
         }
     }
 
@@ -340,33 +547,13 @@ impl EditVideoApp {
             (Icon::Play, "再生/停止 (Space)")
         };
         let buttons = [
-            (Icon::MarkIn, "インをマーク (I)", TransportAction::MarkIn),
-            (
-                Icon::MarkOut,
-                "アウトをマーク (O)",
-                TransportAction::MarkOut,
-            ),
-            (
-                Icon::GoToIn,
-                "インへ移動 (Shift+I)",
-                TransportAction::GoToIn,
-            ),
-            (
-                Icon::StepBack,
-                "1フレーム前へ戻る (←)",
-                TransportAction::Step(-1),
-            ),
-            (play.0, play.1, TransportAction::TogglePlay),
-            (
-                Icon::StepForward,
-                "1フレーム先へ進む (→)",
-                TransportAction::Step(1),
-            ),
-            (
-                Icon::GoToOut,
-                "アウトへ移動 (Shift+O)",
-                TransportAction::GoToOut,
-            ),
+            (Icon::MarkIn, "インをマーク (I)", Action::MarkIn),
+            (Icon::MarkOut, "アウトをマーク (O)", Action::MarkOut),
+            (Icon::GoToIn, "インへ移動 (Shift+I)", Action::GoToIn),
+            (Icon::StepBack, "1フレーム前へ戻る (←)", Action::Step(-1)),
+            (play.0, play.1, Action::TogglePlay),
+            (Icon::StepForward, "1フレーム先へ進む (→)", Action::Step(1)),
+            (Icon::GoToOut, "アウトへ移動 (Shift+O)", Action::GoToOut),
         ];
         let gap = 2.0;
         let (row, _) = ui.allocate_exact_size(
@@ -383,32 +570,27 @@ impl EditVideoApp {
             }
             x += transport::BUTTON_SIZE.x + gap;
         }
-        let font = egui::FontId::monospace(14.0);
+        // 時刻表示は Premiere と同じく、現在時刻を再生ヘッドと同じ青、総尺を通常色で出す
+        let font = egui::FontId::proportional(16.0);
         let painter = ui.painter();
         painter.text(
             row.left_center(),
             egui::Align2::LEFT_CENTER,
-            self.position.to_hms(),
+            self.timecode(self.display_position()),
             font.clone(),
-            ui.visuals().selection.stroke.color,
+            timeline::PLAYHEAD_COLOR,
         );
         painter.text(
             row.right_center(),
             egui::Align2::RIGHT_CENTER,
-            duration.to_hms(),
+            self.timecode(duration),
             font,
             ui.visuals().text_color(),
         );
         if let Some(action) = clicked {
-            self.run_transport(action);
+            let ctx = ui.ctx().clone();
+            self.run_action(&ctx, action);
         }
-    }
-
-    /// IN/OUT 入力欄を現在の IN/OUT 点に合わせる
-    fn refresh_in_out_text(&mut self) {
-        let text = |t: Option<Timestamp>| t.map(secs_string).unwrap_or_default();
-        self.in_text = text(self.timeline.in_point);
-        self.out_text = text(self.timeline.out_point);
     }
 
     fn can_export(&self) -> bool {
@@ -513,6 +695,23 @@ impl EditVideoApp {
                 ui.spinner();
                 ui.label("読み込み中…");
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 右から並ぶので Redo を先に置く
+                if ui
+                    .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                    .on_hover_text("やり直し (Ctrl+Shift+Z)")
+                    .clicked()
+                {
+                    self.undo_redo(true);
+                }
+                if ui
+                    .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
+                    .on_hover_text("取り消し (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.undo_redo(false);
+                }
+            });
         });
     }
 
@@ -536,49 +735,6 @@ impl EditVideoApp {
                 "音声なし"
             });
         });
-        ui.separator();
-        self.in_out_editor(ui);
-    }
-
-    /// 動作確認用の簡易 IN/OUT 入力（本格的なタイムライン UI は後続ステップ）
-    fn in_out_editor(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("IN/OUT（秒）");
-            ui.add(egui::TextEdit::singleline(&mut self.in_text).desired_width(80.0));
-            ui.label("〜");
-            ui.add(egui::TextEdit::singleline(&mut self.out_text).desired_width(80.0));
-            if ui.button("設定").clicked() {
-                match (parse_secs(&self.in_text), parse_secs(&self.out_text)) {
-                    (Ok(i), Ok(o)) => {
-                        self.timeline.clear_in_out();
-                        if let Some(o) = o {
-                            self.timeline.set_out(o);
-                        }
-                        if let Some(i) = i {
-                            self.timeline.set_in(i);
-                        }
-                    }
-                    _ => self.error = Some("IN/OUT は秒の数値で入力してください".into()),
-                }
-            }
-            if ui.button("クリア").clicked() {
-                self.timeline.clear_in_out();
-                self.in_text.clear();
-                self.out_text.clear();
-            }
-        });
-        let fmt = |t: Option<Timestamp>| t.map_or("—".to_owned(), |t| t.to_hms());
-        let ranges = self.timeline.export_ranges();
-        let total = ranges
-            .iter()
-            .fold(Timestamp::ZERO, |acc, r| acc + (r.end - r.start));
-        ui.label(format!(
-            "IN {} / OUT {}　書き出し対象: {} 区間・{}",
-            fmt(self.timeline.in_point),
-            fmt(self.timeline.out_point),
-            ranges.len(),
-            total.to_hms()
-        ));
     }
 
     fn export_windows(&mut self, ctx: &egui::Context) {
@@ -677,36 +833,13 @@ impl EditVideoApp {
     }
 }
 
-/// 秒の入力をタイムスタンプに（空欄は None）
-fn parse_secs(s: &str) -> Result<Option<Timestamp>, ()> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
-    let v: f64 = s.parse().map_err(|_| ())?;
-    if !v.is_finite() || v < 0.0 {
-        return Err(());
-    }
-    Ok(Some(Timestamp((v * 1e6).round() as i64)))
-}
-
 impl eframe::App for EditVideoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_probe(&ctx);
         self.poll_export();
-        self.sync_player_timeline();
         self.poll_player(&ctx);
         self.handle_keys(&ctx);
-
-        let open_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
-        if ui.ctx().input_mut(|i| i.consume_shortcut(&open_shortcut)) {
-            self.open_dialog(ui.ctx());
-        }
-        let export_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::M);
-        if ui.ctx().input_mut(|i| i.consume_shortcut(&export_shortcut)) {
-            self.export_dialog_open();
-        }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
 
@@ -728,6 +861,9 @@ impl eframe::App for EditVideoApp {
                 ui.add_space(4.0);
                 self.transport(ui);
                 ui.separator();
+                self.timeline_panel(ui);
+                self.edit_bar(ui);
+                ui.separator();
                 self.media_info(ui);
                 ui.add_space(4.0);
             });
@@ -735,20 +871,7 @@ impl eframe::App for EditVideoApp {
         }
 
         self.export_windows(&ctx);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_secs_cases() {
-        assert_eq!(parse_secs(""), Ok(None));
-        assert_eq!(parse_secs(" 2.5 "), Ok(Some(Timestamp(2_500_000))));
-        assert_eq!(parse_secs("0"), Ok(Some(Timestamp(0))));
-        assert_eq!(parse_secs("-1"), Err(()));
-        assert_eq!(parse_secs("abc"), Err(()));
-        assert_eq!(parse_secs("inf"), Err(()));
+        // 今フレームの編集をプレイヤーへ反映する
+        self.sync_player_timeline();
     }
 }

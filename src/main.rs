@@ -46,7 +46,9 @@ fn install_japanese_font(ctx: &egui::Context) {
         ..Default::default()
     });
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("japanese".to_owned(), Arc::new(data));
+    fonts
+        .font_data
+        .insert("japanese".to_owned(), Arc::new(data));
     fonts
         .families
         .entry(egui::FontFamily::Proportional)

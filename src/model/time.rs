@@ -142,6 +142,35 @@ impl Rational {
     pub fn frame_duration(self) -> Timestamp {
         self.frame_start(1)
     }
+
+    /// 時刻 t を含むフレームのタイムコード（Premiere Pro と同じ表記）。
+    /// 29.97 / 59.94fps はドロップフレーム `HH;MM;SS;FF`、それ以外はノンドロップ `HH:MM:SS:FF`
+    pub fn timecode(self, t: Timestamp) -> String {
+        if !self.is_positive() {
+            return t.to_hms();
+        }
+        let sign = if t.0 < 0 { "-" } else { "" };
+        let mut frame = self.frame_at(Timestamp(t.0.abs()));
+        // 1秒あたりの名目フレーム数（23.976 → 24, 29.97 → 30）
+        let nominal = ((self.num + self.den / 2) / self.den).max(1);
+        let drop_frame = self.den == 1001 && nominal % 30 == 0;
+        if drop_frame {
+            // 10分ごとの分を除く毎分の先頭で番号を drop 個飛ばす（SMPTE ドロップフレーム）
+            let drop = nominal / 15;
+            let per_min = nominal * 60 - drop;
+            let per_10min = nominal * 600 - drop * 9;
+            let (d, m) = (frame / per_10min, frame % per_10min);
+            frame += drop * 9 * d;
+            if m > drop {
+                frame += drop * ((m - drop) / per_min);
+            }
+        }
+        let ff = frame % nominal;
+        let total_s = frame / nominal;
+        let (h, m, s) = (total_s / 3_600, total_s / 60 % 60, total_s % 60);
+        let sep = if drop_frame { ';' } else { ':' };
+        format!("{sign}{h:02}{sep}{m:02}{sep}{s:02}{sep}{ff:02}")
+    }
 }
 
 impl fmt::Display for Rational {
@@ -241,6 +270,42 @@ mod tests {
         let t = ntsc().frame_start(107_892);
         assert_eq!(t.to_hms(), "00:59:59.996");
         assert_eq!(format!("{}", Timestamp::from_millis(1_234)), "00:00:01.234");
+    }
+
+    #[test]
+    fn timecode_non_drop() {
+        let fps25 = Rational::new(25, 1).unwrap();
+        assert_eq!(fps25.timecode(Timestamp(0)), "00:00:00:00");
+        assert_eq!(fps25.timecode(Timestamp(27_520_000)), "00:00:27:13");
+        assert_eq!(fps25.timecode(Timestamp(39_999)), "00:00:00:00");
+        assert_eq!(
+            fps25.timecode(Timestamp::from_secs(3_600 + 61)),
+            "01:01:01:00"
+        );
+        // 23.976fps はノンドロップ（名目 24 フレーム）
+        let film = Rational::new(24000, 1001).unwrap();
+        assert_eq!(film.timecode(film.frame_start(24)), "00:00:01:00");
+        assert_eq!(film.timecode(film.frame_start(23)), "00:00:00:23");
+        // fps 不明は秒表示
+        let zero = Rational::new(0, 1).unwrap();
+        assert_eq!(zero.timecode(Timestamp(1_500_000)), "00:00:01.500");
+    }
+
+    #[test]
+    fn timecode_drop_frame() {
+        let fps = ntsc();
+        let tc = |n| fps.timecode(fps.frame_start(n));
+        assert_eq!(tc(0), "00;00;00;00");
+        assert_eq!(tc(1799), "00;00;59;29");
+        // 1分の先頭は ;00 と ;01 を飛ばす
+        assert_eq!(tc(1800), "00;01;00;02");
+        // 10分ちょうどは飛ばさない
+        assert_eq!(tc(17_981), "00;09;59;29");
+        assert_eq!(tc(17_982), "00;10;00;00");
+        // 1時間 = 107892 フレーム
+        assert_eq!(tc(107_892), "01;00;00;00");
+        let fps60 = Rational::new(60000, 1001).unwrap();
+        assert_eq!(fps60.timecode(fps60.frame_start(3600)), "00;01;00;04");
     }
 
     #[test]

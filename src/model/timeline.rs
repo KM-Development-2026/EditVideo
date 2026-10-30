@@ -123,6 +123,21 @@ impl Timeline {
         None
     }
 
+    /// タイムライン時刻 t を、そのセグメントの素材で最寄りのフレーム開始時刻へ寄せる
+    /// （セグメント範囲内にクランプ）。範囲外ならそのまま返す。
+    pub fn snap_to_frame(&self, t: Timestamp) -> Timestamp {
+        let Some((idx, src)) = self.locate(t) else {
+            return t;
+        };
+        let seg = &self.segments[idx];
+        let (Some(info), Some((seg_start, _))) = (self.source(seg.source), self.segment_range(idx))
+        else {
+            return t;
+        };
+        let snapped = info.fps.snap(src).clamp_to(seg.start, seg.end);
+        seg_start + (snapped - seg.start)
+    }
+
     /// タイムライン時刻 t を含むセグメントを2分割する。
     /// 境界ちょうど・範囲外では何もしない（長さ0のセグメントを作らない）。
     /// 分割した場合 true。
@@ -434,6 +449,22 @@ mod tests {
         assert_eq!(tl.segments[0].duration(), Timestamp(1));
         assert_eq!(tl.segments[2].duration(), Timestamp(1));
         assert_invariants(&tl);
+    }
+
+    #[test]
+    fn snap_to_frame_uses_segment_source() {
+        // 30fps: 1フレーム = 33333.3us（開始時刻は切り上げ）
+        let mut tl = single(10);
+        assert_eq!(tl.snap_to_frame(Timestamp(40_000)), Timestamp(33_334));
+        assert_eq!(tl.snap_to_frame(Timestamp(10_000)), Timestamp(0));
+        // 後ろのセグメントは素材時刻で丸めてからタイムライン時刻に戻す
+        tl.split_at(ts(4));
+        tl.segments.swap(0, 1);
+        // タイムライン [0,6) = 素材 [4,10)
+        assert_eq!(tl.snap_to_frame(Timestamp(40_000)), Timestamp(33_334));
+        // 範囲外はそのまま
+        assert_eq!(tl.snap_to_frame(ts(20)), ts(20));
+        assert_eq!(tl.snap_to_frame(ts(10)), ts(10));
     }
 
     #[test]
