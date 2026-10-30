@@ -297,6 +297,8 @@ mod tests {
             height: 1080,
             fps: Rational::new(30, 1).unwrap(),
             has_audio: true,
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
             keyframes: Vec::new(),
         }
     }

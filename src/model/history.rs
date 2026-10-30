@@ -109,6 +109,8 @@ mod tests {
             height: 480,
             fps: Rational::new(30, 1).unwrap(),
             has_audio: false,
+            video_codec: None,
+            audio_codec: None,
             keyframes: Vec::new(),
         });
         tl

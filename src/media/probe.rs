@@ -19,6 +19,7 @@ struct ProbeOutput {
 #[derive(Deserialize)]
 struct ProbeStream {
     codec_type: Option<String>,
+    codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     r_frame_rate: Option<String>,
@@ -77,10 +78,10 @@ pub fn parse_probe_json(path: &Path, json: &str) -> Result<MediaInfo> {
                 && s.disposition.as_ref().is_none_or(|d| d.attached_pic == 0)
         })
         .ok_or_else(|| anyhow!("映像ストリームがありません"))?;
-    let has_audio = out
+    let audio = out
         .streams
         .iter()
-        .any(|s| s.codec_type.as_deref() == Some("audio"));
+        .find(|s| s.codec_type.as_deref() == Some("audio"));
 
     let fps = [&video.r_frame_rate, &video.avg_frame_rate]
         .into_iter()
@@ -102,7 +103,9 @@ pub fn parse_probe_json(path: &Path, json: &str) -> Result<MediaInfo> {
         width: video.width.unwrap_or(0),
         height: video.height.unwrap_or(0),
         fps,
-        has_audio,
+        has_audio: audio.is_some(),
+        video_codec: video.codec_name.clone(),
+        audio_codec: audio.and_then(|a| a.codec_name.clone()),
         keyframes: Vec::new(),
     })
 }
@@ -167,6 +170,8 @@ mod tests {
         assert_eq!(info.height, 1080);
         assert_eq!(info.fps, Rational::new(30000, 1001).unwrap());
         assert!(info.has_audio);
+        assert_eq!(info.video_codec.as_deref(), Some("h264"));
+        assert_eq!(info.audio_codec.as_deref(), Some("aac"));
         assert_eq!(info.duration, Timestamp(60_032_000));
         assert!(info.keyframes.is_empty());
     }
@@ -179,6 +184,8 @@ mod tests {
         }"#;
         let info = parse(json).unwrap();
         assert!(!info.has_audio);
+        assert_eq!(info.video_codec, None);
+        assert_eq!(info.audio_codec, None);
         assert_eq!(info.fps, Rational::new(25, 1).unwrap());
         assert_eq!(info.duration, Timestamp::from_secs(5));
     }

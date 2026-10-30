@@ -74,7 +74,7 @@ Windows 向け・Rust 製のシンプルな動画編集 GUI アプリ。個人�
 
 設計方針
 - **model は純粋**：ffmpeg や egui に依存させず、テスト容易にする。
-- **ffmpeg 引数生成は純粋関数**：`Timeline → Vec<String>` をテストで検証し、実行部と分離。
+- **ffmpeg 引数生成は純粋関数**：`Timeline → Vec<OsString>` をテストで検証し、実行部と分離。
 - **UI はブロックしない**：重い処理はすべてワーカースレッド。UI は毎フレーム `try_recv` で結果を受け取る。
 
 ## 4. データモデル
@@ -90,6 +90,8 @@ pub struct MediaInfo {
     pub height: u32,
     pub fps: Rational,           // 例: 30000/1001
     pub has_audio: bool,
+    pub video_codec: Option<String>, // 例: "h264"（高速モードの連結可否判定用）
+    pub audio_codec: Option<String>, // 音声なしなら None
     pub keyframes: Vec<Timestamp>, // 高速モードのスナップ・警告用（遅延取得）
 }
 
@@ -182,23 +184,46 @@ rodio + `ffmpeg -f s16le pipe:1` により実装し、音声クロックをマ�
 
 ### 正確モードのコマンド例（2区間）
 ```
-ffmpeg -ss 0 -to 5  -i in.mp4
-       -ss 10 -to 20 -i in.mp4
- -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]"
- -map [v] -map [a] -c:v libx264 -crf 20 -preset medium -c:a aac
- -progress pipe:1 -nostats out.mp4
+ffmpeg -hide_banner
+       -ss 0.000000 -to 5.000000  -i in.mp4
+       -ss 10.000000 -to 20.000000 -i in.mp4
+ -filter_complex "[0:V][0:a][1:V][1:a]concat=n=2:v=1:a=1[v][a]"
+ -map [v] -map [a] -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -c:a aac
+ -movflags +faststart -progress pipe:1 -nostats -y out.mp4
 ```
 - 区間ごとに別入力とし、`-i` の前に `-ss/-to` を置く（入力シーク）。再エンコード時の入力シークはフレーム単位で正確で、
-  `trim` フィルタと違って先頭から全デコードしないため長尺動画でも速い。
+  `trim` フィルタと違って先頭から全デコードしないため長尺動画でも速い。区間が1つでも同じ方式。
+- 時刻は `Timestamp` からマイクロ秒精度の秒文字列（例 `12.345678`）にする（浮動小数を経由しない）。
+- 映像は `[i:V]`（添付画像を除く映像）を使う。
 - 入力が素材ごとではなく区間ごとなので、複数ファイル連結（v0.3）も同じ形で扱える。
-- 区間が多い場合はフィルタ文字列をファイルに書き出し `-/filter_complex <path>` で渡す（コマンド長制限対策。ffmpeg 7 以降で `-filter_complex_script` は非推奨）。
-- 音声なし動画は a 系を省略。
-- エンコーダ設定（MVP）：H.264 + AAC、品質プリセット（高/標準/軽量 → CRF 18/20/23）。
+- **フィルタのファイル渡し**：フィルタ文字列が 4000 文字を超える、またはコマンドライン全体の見積もり長が
+  31743 文字（Windows の 32767 文字 − 実行ファイルパス用の余裕 1024）を超える場合は、
+  一時ディレクトリの `filter.txt` に書き出し `-/filter_complex <path>` で渡す（ffmpeg 7 以降で `-filter_complex_script` は非推奨）。
+  それでも入力指定（`-ss/-to/-i` × 区間数）だけで上限を超える場合はエラーにする。
+- **音声**：
+  - 全素材が音声なし → `a=0`、`-map [v]` のみ、`-c:a` も付けない。
+  - 1つでも音声あり → `a=1`。音声なし素材の区間は、フィルタ内で `anullsrc=r=48000:cl=stereo:d=<区間長>` の無音を生成して埋める
+    （入力を増やさない）。サンプルレート・チャンネル数の違いは concat の形式ネゴシエーションで自動変換される。
+- **解像度・fps の統一**：先頭区間の素材の解像度（yuv420p のため偶数に切り下げ）・fps を基準とし、
+  いずれかの区間の素材が異なる場合のみ全映像に
+  `scale=W:H:force_original_aspect_ratio=decrease,pad=W:H:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=F` を入れる。
+- エンコーダ設定（MVP）：H.264 + AAC、品質プリセット（高/標準/軽量 → CRF 18/20/23、既定は標準）。
+
+### 高速モードの手順
+1. 区間ごとに `-ss a -to b -i src -map 0:V -map 0:a? -c copy -avoid_negative_ts make_zero <tmp>/part_NNNN.<出力の拡張子>`
+   （添付画像・字幕・データストリームは連結時に失敗しやすいため映像と音声のみ）。
+2. `<tmp>/list.txt` に `ffconcat version 1.0` と `file 'part_NNNN.ext'`（リストからの相対パス。`'` は `'\''` にエスケープ）を書く。
+3. `-f concat -safe 0 -i list.txt -map 0 -c copy -movflags +faststart -progress pipe:1 -nostats -y out` で連結。
+- 素材が複数ある場合、コーデック（映像・音声）・解像度・fps・音声有無がすべて一致しなければエラー（`MediaInfo` に `video_codec` / `audio_codec` を持たせる）。
 
 ### 進捗・キャンセル
-- `-progress pipe:1` の `out_time_us` を読み、書き出し総尺に対する割合を算出。
+- `-progress pipe:1` の `out_time_us`（または `out_time_ms`。値はどちらもマイクロ秒）を読み、書き出し総尺に対する割合を算出。
+- 高速モードは「区間ごとのコピー（各区間長）＋連結（総尺）」を重みとして段階的に進捗を出す。
+- stderr は別スレッドで読み続け（パイプ詰まり防止）、末尾 30 行を保持する。
+- 一時ファイルは `std::env::temp_dir()` 配下に一意名のディレクトリを作って置き、成功・失敗・キャンセルいずれでも削除する。
 - キャンセル時はプロセス kill → 出力途中ファイルと一時ファイルを削除。
-- 失敗時は stderr の末尾を保持してエラーダイアログに表示。
+- 失敗時は stderr の末尾を含めたメッセージをエラーダイアログに表示し、出力途中ファイルを削除。
+- 出力先が入力素材と同じファイルの場合は開始前にエラー（上書き防止）。
 
 ## 7. 画面構成
 
