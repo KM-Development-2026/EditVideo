@@ -15,6 +15,20 @@ use crate::model::history::History;
 use crate::model::timeline::{Segment, Timeline};
 use crate::model::{MediaInfo, Timestamp};
 use crate::ui::preview::Preview;
+use crate::ui::transport::{self, Icon};
+
+/// トランスポート操作
+#[derive(Clone, Copy)]
+enum TransportAction {
+    MarkIn,
+    MarkOut,
+    GoToIn,
+    GoToOut,
+    GoToStart,
+    GoToEnd,
+    Step(i64),
+    TogglePlay,
+}
 
 /// 対応する拡張子（ファイル選択ダイアログのフィルタ）
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -66,7 +80,16 @@ pub struct EditVideoApp {
 }
 
 impl EditVideoApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    /// `initial` を指定すると起動直後にその動画を開く（コマンドライン引数・exe へのドロップ）
+    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+        let mut app = Self::empty();
+        if let Some(path) = initial {
+            app.open_path(&cc.egui_ctx, path);
+        }
+        app
+    }
+
+    fn empty() -> Self {
         let ffmpeg = ffmpeg::locate().map_err(|e| format!("{e:#}"));
         let error = ffmpeg.as_ref().err().cloned();
         Self {
@@ -94,13 +117,6 @@ impl EditVideoApp {
         if self.probing.is_some() || self.export.is_some() {
             return;
         }
-        let ffprobe = match &self.ffmpeg {
-            Ok(p) => p.ffprobe.clone(),
-            Err(e) => {
-                self.error = Some(e.clone());
-                return;
-            }
-        };
         let Some(path) = rfd::FileDialog::new()
             .set_title("動画を開く")
             .add_filter("動画ファイル", VIDEO_EXTENSIONS)
@@ -109,7 +125,17 @@ impl EditVideoApp {
         else {
             return;
         };
+        self.open_path(ctx, path);
+    }
 
+    fn open_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        let ffprobe = match &self.ffmpeg {
+            Ok(p) => p.ffprobe.clone(),
+            Err(e) => {
+                self.error = Some(e.clone());
+                return;
+            }
+        };
         // ffprobe は UI を止めないよう別スレッドで実行
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
@@ -230,75 +256,71 @@ impl EditVideoApp {
         }
     }
 
-    /// Space / ← / →（テキスト入力中は無効）。本格的なキーマップは後続ステップ
+    /// トランスポート系のキー（Premiere Pro 準拠。テキスト入力中は無効）。
+    /// 本格的なキーマップは後続ステップ
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if self.player.is_none() || ctx.text_edit_focused() {
             return;
         }
-        let none = egui::Modifiers::NONE;
-        let (space, left, right) = ctx.input_mut(|i| {
-            (
-                i.consume_key(none, egui::Key::Space),
-                i.consume_key(none, egui::Key::ArrowLeft),
-                i.consume_key(none, egui::Key::ArrowRight),
-            )
+        use egui::{Key, Modifiers};
+        // consume_key は余分な Shift を無視して一致するので、Shift 付きを先に判定する
+        let bindings = [
+            (Modifiers::SHIFT, Key::ArrowLeft, TransportAction::Step(-5)),
+            (Modifiers::SHIFT, Key::ArrowRight, TransportAction::Step(5)),
+            (Modifiers::SHIFT, Key::I, TransportAction::GoToIn),
+            (Modifiers::SHIFT, Key::O, TransportAction::GoToOut),
+            (Modifiers::NONE, Key::Space, TransportAction::TogglePlay),
+            (Modifiers::NONE, Key::ArrowLeft, TransportAction::Step(-1)),
+            (Modifiers::NONE, Key::ArrowRight, TransportAction::Step(1)),
+            (Modifiers::NONE, Key::I, TransportAction::MarkIn),
+            (Modifiers::NONE, Key::O, TransportAction::MarkOut),
+            (Modifiers::NONE, Key::Home, TransportAction::GoToStart),
+            (Modifiers::NONE, Key::End, TransportAction::GoToEnd),
+        ];
+        let actions: Vec<_> = ctx.input_mut(|i| {
+            bindings
+                .iter()
+                .filter(|(m, k, _)| i.consume_key(*m, *k))
+                .map(|(_, _, a)| *a)
+                .collect()
         });
-        if space {
-            self.toggle_play();
-        }
-        if left {
-            self.send_player(PlayerCommand::StepFrame(-1));
-        }
-        if right {
-            self.send_player(PlayerCommand::StepFrame(1));
+        for a in actions {
+            self.run_transport(a);
         }
     }
 
-    /// 簡易トランスポート（先頭・コマ送り・再生/停止・末尾・時刻・シークスライダー）
+    fn run_transport(&mut self, action: TransportAction) {
+        let duration = self.timeline.duration();
+        match action {
+            TransportAction::MarkIn => {
+                self.timeline.set_in(self.position);
+                self.refresh_in_out_text();
+            }
+            TransportAction::MarkOut => {
+                self.timeline.set_out(self.position);
+                self.refresh_in_out_text();
+            }
+            // IN/OUT 未設定なら先頭/末尾へ（Premiere と同じ）
+            TransportAction::GoToIn => self.send_player(PlayerCommand::Seek(
+                self.timeline.in_point.unwrap_or(Timestamp::ZERO),
+            )),
+            TransportAction::GoToOut => self.send_player(PlayerCommand::Seek(
+                self.timeline.out_point.unwrap_or(duration),
+            )),
+            TransportAction::GoToStart => self.send_player(PlayerCommand::Seek(Timestamp::ZERO)),
+            TransportAction::GoToEnd => self.send_player(PlayerCommand::Seek(duration)),
+            TransportAction::Step(n) => self.send_player(PlayerCommand::StepFrame(n)),
+            TransportAction::TogglePlay => self.toggle_play(),
+        }
+    }
+
+    /// トランスポート（Premiere Pro のプログラムモニター風）。
+    /// 上段: シークバー、下段: 現在時刻（左）・操作ボタン（中央）・総尺（右）
     fn transport(&mut self, ui: &mut egui::Ui) {
         if self.player.is_none() {
             return;
         }
         let duration = self.timeline.duration();
-        ui.horizontal(|ui| {
-            if ui.button("|◀").on_hover_text("先頭へ").clicked() {
-                self.send_player(PlayerCommand::Seek(Timestamp::ZERO));
-            }
-            if ui.button("◀").on_hover_text("1フレーム戻る (←)").clicked() {
-                self.send_player(PlayerCommand::StepFrame(-1));
-            }
-            let label = if self.playing { "‖" } else { "▶" };
-            if ui
-                .add(egui::Button::new(label).min_size(egui::vec2(36.0, 0.0)))
-                .on_hover_text("再生 / 一時停止 (Space)")
-                .clicked()
-            {
-                self.toggle_play();
-            }
-            if ui.button("▶").on_hover_text("1フレーム進む (→)").clicked() {
-                self.send_player(PlayerCommand::StepFrame(1));
-            }
-            if ui.button("▶|").on_hover_text("末尾へ").clicked() {
-                self.send_player(PlayerCommand::Seek(duration));
-            }
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} / {}",
-                    self.position.to_hms(),
-                    duration.to_hms()
-                ))
-                .monospace(),
-            );
-            ui.separator();
-            if ui.button("現在位置を IN に").clicked() {
-                self.timeline.set_in(self.position);
-                self.refresh_in_out_text();
-            }
-            if ui.button("現在位置を OUT に").clicked() {
-                self.timeline.set_out(self.position);
-                self.refresh_in_out_text();
-            }
-        });
         ui.scope(|ui| {
             ui.spacing_mut().slider_width = ui.available_width();
             let mut secs = self.scrub.unwrap_or_else(|| self.position.as_secs_f64());
@@ -311,6 +333,75 @@ impl EditVideoApp {
             }
             self.scrub_dragging = resp.dragged();
         });
+
+        let play = if self.playing {
+            (Icon::Stop, "再生/停止 (Space)")
+        } else {
+            (Icon::Play, "再生/停止 (Space)")
+        };
+        let buttons = [
+            (Icon::MarkIn, "インをマーク (I)", TransportAction::MarkIn),
+            (
+                Icon::MarkOut,
+                "アウトをマーク (O)",
+                TransportAction::MarkOut,
+            ),
+            (
+                Icon::GoToIn,
+                "インへ移動 (Shift+I)",
+                TransportAction::GoToIn,
+            ),
+            (
+                Icon::StepBack,
+                "1フレーム前へ戻る (←)",
+                TransportAction::Step(-1),
+            ),
+            (play.0, play.1, TransportAction::TogglePlay),
+            (
+                Icon::StepForward,
+                "1フレーム先へ進む (→)",
+                TransportAction::Step(1),
+            ),
+            (
+                Icon::GoToOut,
+                "アウトへ移動 (Shift+O)",
+                TransportAction::GoToOut,
+            ),
+        ];
+        let gap = 2.0;
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), transport::BUTTON_SIZE.y),
+            egui::Sense::hover(),
+        );
+        let buttons_w = buttons.len() as f32 * (transport::BUTTON_SIZE.x + gap) - gap;
+        let mut x = row.center().x - buttons_w / 2.0;
+        let mut clicked = None;
+        for (icon, tip, action) in buttons {
+            let rect = egui::Rect::from_min_size(egui::pos2(x, row.top()), transport::BUTTON_SIZE);
+            if transport::icon_button(ui, rect, icon, tip).clicked() {
+                clicked = Some(action);
+            }
+            x += transport::BUTTON_SIZE.x + gap;
+        }
+        let font = egui::FontId::monospace(14.0);
+        let painter = ui.painter();
+        painter.text(
+            row.left_center(),
+            egui::Align2::LEFT_CENTER,
+            self.position.to_hms(),
+            font.clone(),
+            ui.visuals().selection.stroke.color,
+        );
+        painter.text(
+            row.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            duration.to_hms(),
+            font,
+            ui.visuals().text_color(),
+        );
+        if let Some(action) = clicked {
+            self.run_transport(action);
+        }
     }
 
     /// IN/OUT 入力欄を現在の IN/OUT 点に合わせる

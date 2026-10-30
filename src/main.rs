@@ -26,7 +26,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             install_japanese_font(&cc.egui_ctx);
-            Ok(Box::new(EditVideoApp::new(cc)))
+            let initial = std::env::args_os().nth(1).map(Into::into);
+            Ok(Box::new(EditVideoApp::new(cc, initial)))
         }),
     )
 }
