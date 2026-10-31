@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use super::audio::{AudioClock, AudioOutput, AudioPlayback};
 use super::ffmpeg;
 use crate::export::command::secs_string;
 use crate::export::runner::read_tail;
@@ -122,6 +123,9 @@ impl Player {
             speed: 1,
             reverse_buf: Vec::new(),
             reverse_frame_duration: Timestamp::ZERO,
+            audio_out: None,
+            audio_unavailable: false,
+            audio: None,
         };
         let handle = std::thread::Builder::new()
             .name("player".into())
@@ -538,12 +542,14 @@ struct Unsent {
     rgba: Vec<u8>,
 }
 
-/// 再生クロック（origin_time を origin で表示した基準。rate は倍率、負なら逆再生）
-#[derive(Clone, Copy)]
+/// 再生クロック（origin_time を origin で表示した基準。rate は倍率、負なら逆再生）。
+/// 音声を鳴らしている間は音声の再生位置を基準にする
+#[derive(Clone)]
 struct Clock {
     origin: Instant,
     origin_time: Timestamp,
     rate: i32,
+    audio: Option<AudioClock>,
 }
 
 impl Clock {
@@ -552,11 +558,22 @@ impl Clock {
             origin: Instant::now(),
             origin_time: t,
             rate,
+            audio: None,
+        }
+    }
+
+    fn audio(audio: AudioClock) -> Self {
+        Self {
+            audio: Some(audio),
+            ..Self::start(Timestamp::ZERO, 1)
         }
     }
 
     fn now(&self) -> Timestamp {
-        clock_time(self.origin_time, self.origin.elapsed(), self.rate)
+        match &self.audio {
+            Some(a) => a.now(),
+            None => clock_time(self.origin_time, self.origin.elapsed(), self.rate),
+        }
     }
 
     /// 時刻 t のフレームの表示時刻に達したか（逆再生では時刻が減る向きに進む）
@@ -613,6 +630,12 @@ struct Worker {
     reverse_buf: Vec<Unsent>,
     /// reverse_buf の1枚あたりの表示期間（タイムライン時刻）
     reverse_frame_duration: Timestamp,
+    /// 音声出力デバイス（最初に音声を鳴らすときに開く）
+    audio_out: Option<AudioOutput>,
+    /// 出力デバイスを開けなかった（以降は試さない）
+    audio_unavailable: bool,
+    /// 鳴らしている音声（等速の順再生中のみ）
+    audio: Option<AudioPlayback>,
 }
 
 impl Worker {
@@ -706,6 +729,7 @@ impl Worker {
         if state == PlaybackState::Paused {
             self.speed = 1;
             self.reverse_buf.clear();
+            self.audio = None;
         }
         if self.state != state {
             self.state = state;
@@ -751,6 +775,8 @@ impl Worker {
             self.clock = None;
             self.drops = 0;
             self.speed = speed;
+            // 等速の順再生に戻ったら音声を鳴らし直す（それ以外は無音）
+            self.start_audio_clock(self.position);
             return;
         }
         if speed > 0 {
@@ -790,12 +816,37 @@ impl Worker {
         }
         self.position = start;
         self.drops = 0;
-        // プロセスを起動し直す場合は最初のフレームを読んだ時点からクロックを進める
-        self.clock = self
-            .decoder
-            .as_ref()
-            .map(|_| Clock::start(start, self.speed));
+        // 音声を鳴らせなければ壁時計。プロセスを起動し直す場合は最初のフレームを読んだ時点から進める
+        if !self.start_audio_clock(start) {
+            self.clock = self
+                .decoder
+                .as_ref()
+                .map(|_| Clock::start(start, self.speed));
+        }
         self.set_state(PlaybackState::Playing);
+    }
+
+    /// 等速の順再生なら at から音声を鳴らし、その再生位置をクロックにする。鳴らした場合 true。
+    /// 音声の無いタイムライン・出力デバイスを開けない場合・シャトル中は鳴らさない
+    fn start_audio_clock(&mut self, at: Timestamp) -> bool {
+        self.audio = None;
+        if self.speed != 1 || !self.timeline.sources.iter().any(|s| s.has_audio) {
+            return false;
+        }
+        if self.audio_out.is_none() && !self.audio_unavailable {
+            match AudioOutput::open() {
+                Ok(out) => self.audio_out = Some(out),
+                // 開けない環境では以降も試さない（映像だけ再生する）
+                Err(_) => self.audio_unavailable = true,
+            }
+        }
+        let Some(out) = &self.audio_out else {
+            return false;
+        };
+        let playback = out.play(&self.ffmpeg, &self.timeline, at);
+        self.clock = Some(Clock::audio(playback.clock()));
+        self.audio = Some(playback);
+        true
     }
 
     /// 再生中のシーク。順再生では無効セグメント内なら次の有効セグメント先頭へ。
@@ -815,11 +866,13 @@ impl Worker {
                 self.position = start;
                 self.drops = 0;
                 self.clock = None;
+                self.start_audio_clock(start);
             }
             None => {
                 // 末尾以降: 指定位置を表示して止める
                 self.state = PlaybackState::Paused;
                 self.clock = None;
+                self.audio = None;
                 self.show_at(t);
                 self.send(PlayerEvent::Ended);
                 self.send(PlayerEvent::State(PlaybackState::Paused));
@@ -853,7 +906,7 @@ impl Worker {
     /// 再生中、時刻 t のフレームの表示時刻まで待つ（その間もコマンドを受け付ける）。
     /// 表示してよければ true。コマンドが届いた・まだ早い場合は false（次のループで再度呼ばれる）
     fn wait_until_due(&mut self, t: Timestamp) -> bool {
-        let Some(clock) = self.clock else {
+        let Some(clock) = self.clock.clone() else {
             return true;
         };
         if clock.reached(t) {
@@ -875,9 +928,10 @@ impl Worker {
     /// 読んだフレームを送る。進行方向に遅れていれば読み捨てる（停止時に最後の1枚は届ける）
     fn present(&mut self, frame: Unsent, frame_duration: Timestamp) {
         self.position = frame.time;
-        let clock = *self
+        let clock = self
             .clock
-            .get_or_insert_with(|| Clock::start(frame.time, self.speed));
+            .get_or_insert_with(|| Clock::start(frame.time, self.speed))
+            .clone();
         let busy = self.in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT;
         self.unsent = Some(frame);
         if clock.should_drop(self.position, frame_duration, self.drops) || busy {
@@ -1139,8 +1193,9 @@ impl Worker {
             return self.end();
         };
         self.position = start;
-        if idx != next {
-            // 無効セグメントを飛ばしたので、次の最初のフレームからクロックを合わせ直す
+        // 無効セグメントを飛ばしたので、次の最初のフレームからクロックを合わせ直す
+        // （音声クロックは音声側で同じように飛ばしているのでそのまま）
+        if idx != next && self.audio.is_none() {
             self.clock = None;
             self.drops = 0;
         }

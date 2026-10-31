@@ -199,9 +199,20 @@ Idle ──open──▶ Paused ──play──▶ Playing
 - プレビュー下に簡易トランスポート（先頭 / 1フレーム戻る / 再生・一時停止 / 1フレーム進む / 末尾、現在時刻 / 総尺、シークスライダー）と
   「現在位置を IN / OUT に」。キーは Space・← / → のみ（テキスト入力中は無効）。本格的なキーマップは 12章5 で実装する。
 
-### 音声について
-MVP は映像のみ。音声付きプレビューは A/V 同期が必要で複雑になるため v0.2 で
-rodio + `ffmpeg -f s16le pipe:1` により実装し、音声クロックをマスターにする。
+### 音声について（v0.2・media/audio.rs）
+等速の順再生中のみ音声を鳴らし、**音声クロックをマスター**にする。スクラブ・コマ送り・シャトル（1x 以外・逆再生）は無音。
+- **出力**：rodio 0.23（`default-features = false, features = ["playback"]`。デコードは ffmpeg なので symphonia は入れない）。
+  既定の出力デバイスをプレイヤースレッドで最初の再生時に開き、デバイスのサンプルレート・チャンネル数で PCM を作る（rodio 側で変換させない）。
+  開けない環境では以降試さず、映像だけ壁時計で再生する。
+- **供給（Feeder スレッド）**：再生開始位置から有効セグメントを順にたどり（`audio_parts`）、区間ごとに
+  `ffmpeg -ss <素材時刻> -i <file> -map 0:a:0 -vn -af apad -ac <ch> -ar <rate> -f f32le pipe:1` を起動して
+  区間長ちょうどのフレーム数だけ読む（足りなければ無音で埋め、読み終えたら kill）。音声の無い素材の区間は無音。
+  約 2 秒分を `sync_channel` で先読みし、カット位置で ffmpeg を起動する間も途切れないようにする。
+- **音源（PcmSource）**：受け取った PCM を出力に渡し、渡したサンプル数を数える。データ待ちの間は無音をフレーム単位で出すが数えない。
+- **クロック**：渡したサンプル数 → 再生した長さ → 削除済みを飛ばしたタイムライン時刻（`timeline_time`）。
+  ffmpeg の起動待ち・供給遅れの間はクロックが止まり、映像もそれに合わせて待つ。映像側は削除区間を飛ばしてもクロックを合わせ直さない。
+- 再生・一時停止・シーク・倍率変更・タイムライン差し替え・末尾到達のたびに鳴らし直す／止める（`AudioPlayback` の破棄で停止）。
+- **制約**：出力デバイスのバッファ分の遅延は補正しない（映像が数十 ms 早く見える可能性がある）。
 
 ## 6. 書き出し（export/）
 
@@ -367,12 +378,14 @@ EditVideo/
 │  ├─ app.rs
 │  ├─ ui/{mod,preview,timeline,export,keymap}.rs
 │  ├─ model/{mod,time,timeline,history}.rs
-│  ├─ media/{mod,ffmpeg,probe,player}.rs
+│  ├─ media/{mod,ffmpeg,probe,player,audio}.rs
 │  └─ export/{mod,command,runner}.rs
 └─ tests/
-   ├─ common/mod.rs           # テスト動画の生成など共通ヘルパー
-   ├─ export_integration.rs   # ffmpeg で生成したテスト動画を実際に書き出す
-   └─ player_integration.rs   # テスト動画をプレイヤーでシーク・再生する
+   ├─ common/mod.rs             # テスト動画の生成など共通ヘルパー
+   ├─ export_integration.rs     # ffmpeg で生成したテスト動画を実際に書き出す
+   ├─ player_integration.rs     # テスト動画をプレイヤーでシーク・再生する
+   ├─ keyframe_integration.rs   # キーフレーム取得とスナップ
+   └─ audio_integration.rs      # 音声 PCM の供給・音声クロック（出力デバイスが無ければ一部スキップ）
 ```
 
 ## 11. テスト方針
