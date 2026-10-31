@@ -417,7 +417,6 @@ mod tests {
             has_audio: audio,
             video_codec: Some("h264".into()),
             audio_codec: audio.then(|| "aac".into()),
-            keyframes: Vec::new(),
         }
     }
 

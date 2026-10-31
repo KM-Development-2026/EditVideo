@@ -22,6 +22,4 @@ pub struct MediaInfo {
     pub video_codec: Option<String>,
     /// 音声コーデック名（音声なしなら None）
     pub audio_codec: Option<String>,
-    /// 高速モードのスナップ・警告用（遅延取得。未取得なら空）
-    pub keyframes: Vec<Timestamp>,
 }

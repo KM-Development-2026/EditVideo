@@ -25,6 +25,23 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 ];
 
 type ProbeResult = (PathBuf, Result<MediaInfo, String>);
+/// 素材ごとのキーフレーム位置（`SourceId` の添字）
+type Keyframes = Vec<Vec<Timestamp>>;
+
+/// 書き出し設定ウィンドウに出すキーフレーム確認の状態（高速モード用）
+enum KeyframeView {
+    Checking,
+    Failed(String),
+    Ok,
+    /// 区間開始がキーフレームでない箇所（タイムコード）と、寄せられる箇所の数
+    Issues {
+        at: Vec<String>,
+        snappable: usize,
+    },
+}
+
+/// 一覧に出す区間開始の最大数
+const MAX_LISTED_ISSUES: usize = 5;
 
 /// 書き出し設定ウィンドウの状態
 struct ExportDialog {
@@ -57,6 +74,12 @@ pub struct EditVideoApp {
     export: Option<RunningExport>,
     /// 書き出し結果（Ok = 完了メッセージ, Err = 失敗メッセージ）
     export_result: Option<Result<String, String>>,
+    /// キーフレーム位置（高速モードを選んだときに取得。Undo の対象外なのでタイムラインとは別に持つ）
+    keyframes: Option<Keyframes>,
+    keyframe_probing: Option<Receiver<Result<Keyframes, String>>>,
+    keyframe_error: Option<String>,
+    /// ffmpeg の場所を指定したときのエラー（未検出ダイアログに表示）
+    ffmpeg_setup_error: Option<String>,
     player: Option<Player>,
     /// プレイヤーに渡したタイムラインのセグメント（変更検出用）
     player_segments: Vec<Segment>,
@@ -80,13 +103,13 @@ impl EditVideoApp {
     }
 
     fn empty() -> Self {
+        // 見つからない場合は案内ウィンドウ（ffmpeg_window）を出す
         let ffmpeg = ffmpeg::locate().map_err(|e| format!("{e:#}"));
-        let error = ffmpeg.as_ref().err().cloned();
         Self {
             ffmpeg,
             timeline: Timeline::new(),
             history: History::new(),
-            error,
+            error: None,
             probing: None,
             selection: BTreeSet::new(),
             tool: Tool::default(),
@@ -94,6 +117,10 @@ impl EditVideoApp {
             export_dialog: None,
             export: None,
             export_result: None,
+            keyframes: None,
+            keyframe_probing: None,
+            keyframe_error: None,
+            ffmpeg_setup_error: None,
             player: None,
             player_segments: Vec::new(),
             preview: Preview::default(),
@@ -153,6 +180,9 @@ impl EditVideoApp {
                         self.history.clear();
                         self.selection.clear();
                         self.timeline_view = TimelineView::default();
+                        self.keyframes = None;
+                        self.keyframe_probing = None;
+                        self.keyframe_error = None;
                         self.error = None;
                         self.start_player(ctx);
                     }
@@ -167,6 +197,136 @@ impl EditVideoApp {
                 self.error = Some("ffprobe の実行スレッドが異常終了しました".into());
             }
         }
+    }
+
+    /// 全素材のキーフレーム位置を別スレッドで取得する（取得済み・取得中・失敗済みなら何もしない）
+    fn start_keyframe_probe(&mut self, ctx: &egui::Context) {
+        if self.keyframes.is_some()
+            || self.keyframe_probing.is_some()
+            || self.keyframe_error.is_some()
+        {
+            return;
+        }
+        let Ok(paths) = &self.ffmpeg else { return };
+        let ffprobe = paths.ffprobe.clone();
+        let files: Vec<PathBuf> = self
+            .timeline
+            .sources
+            .iter()
+            .map(|s| s.path.clone())
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = files
+                .iter()
+                .map(|f| probe::probe_keyframes(&ffprobe, f))
+                .collect::<anyhow::Result<Keyframes>>()
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.keyframe_probing = Some(rx);
+    }
+
+    fn poll_keyframes(&mut self) {
+        let Some(rx) = &self.keyframe_probing else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("キーフレーム取得のスレッドが異常終了しました".into())
+            }
+        };
+        self.keyframe_probing = None;
+        match result {
+            Ok(k) => self.keyframes = Some(k),
+            Err(e) => self.keyframe_error = Some(e),
+        }
+    }
+
+    fn keyframe_view(&self) -> KeyframeView {
+        if let Some(e) = &self.keyframe_error {
+            return KeyframeView::Failed(e.clone());
+        }
+        let Some(kfs) = &self.keyframes else {
+            return KeyframeView::Checking;
+        };
+        let issues = self.timeline.keyframe_issues(kfs);
+        if issues.is_empty() {
+            return KeyframeView::Ok;
+        }
+        KeyframeView::Issues {
+            at: issues.iter().map(|i| self.timecode(i.at)).collect(),
+            snappable: issues.iter().filter(|i| i.snap_to.is_some()).count(),
+        }
+    }
+
+    /// ffmpeg が見つからないときの案内ウィンドウ（場所の指定・再検索）
+    fn ffmpeg_window(&mut self, ctx: &egui::Context) {
+        let Err(reason) = &self.ffmpeg else { return };
+        let reason = reason.clone();
+        let mut pick = false;
+        let mut retry = false;
+        egui::Window::new("ffmpeg が見つかりません")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    "EditVideo はインストール済みの ffmpeg / ffprobe を使って動画を読み込み・書き出します。\n\
+                     ffmpeg をインストールして PATH に追加するか、ffmpeg.exe の場所を指定してください\n\
+                     （同じフォルダにある ffprobe.exe も使います）。",
+                );
+                ui.colored_label(ui.visuals().weak_text_color(), &reason);
+                if let Some(e) = &self.ffmpeg_setup_error {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                if let Some(p) = ffmpeg::config_path() {
+                    ui.label(format!("指定した場所は {} に保存されます。", p.display()));
+                }
+                ui.horizontal(|ui| {
+                    pick = ui.button("ffmpeg.exe を選択…").clicked();
+                    retry = ui
+                        .button("再検索")
+                        .on_hover_text("PATH に追加した後に押してください")
+                        .clicked();
+                });
+            });
+        if pick {
+            self.pick_ffmpeg();
+        } else if retry {
+            self.locate_ffmpeg();
+        }
+    }
+
+    fn pick_ffmpeg(&mut self) {
+        let Some(exe) = rfd::FileDialog::new()
+            .set_title("ffmpeg.exe を選択")
+            .add_filter("ffmpeg", &["exe"])
+            .pick_file()
+        else {
+            return;
+        };
+        match ffmpeg::save_location(&exe) {
+            Ok(()) => self.locate_ffmpeg(),
+            Err(e) => self.ffmpeg_setup_error = Some(format!("{e:#}")),
+        }
+    }
+
+    fn locate_ffmpeg(&mut self) {
+        self.ffmpeg = ffmpeg::locate().map_err(|e| format!("{e:#}"));
+        self.ffmpeg_setup_error = None;
+    }
+
+    /// 書き出し区間の開始を最寄りのキーフレームへ寄せる（Undo 可能）
+    fn snap_to_keyframes(&mut self) {
+        let Some(kfs) = self.keyframes.clone() else {
+            return;
+        };
+        self.edit(|tl| tl.snap_to_keyframes(&kfs));
     }
 
     /// 現在のタイムラインでプレイヤーを作り直し、先頭フレームを表示する
@@ -738,6 +898,16 @@ impl EditVideoApp {
     }
 
     fn export_windows(&mut self, ctx: &egui::Context) {
+        // 高速モードではキーフレーム位置を確認する（窓の中でモードを変えた分は次のフレームで反映）
+        let fast = self
+            .export_dialog
+            .as_ref()
+            .is_some_and(|d| d.mode == ExportMode::Fast);
+        if fast {
+            self.start_keyframe_probe(ctx);
+        }
+        let keyframe_view = fast.then(|| self.keyframe_view());
+        let mut snap = false;
         if let Some(dialog) = &mut self.export_dialog {
             let mut start = false;
             let mut close = false;
@@ -764,6 +934,10 @@ impl EditVideoApp {
                             }
                         });
                     });
+                    if let Some(view) = &keyframe_view {
+                        ui.separator();
+                        snap = keyframe_section(ui, view);
+                    }
                     ui.separator();
                     ui.horizontal(|ui| {
                         start = ui.button("実行").clicked();
@@ -781,6 +955,9 @@ impl EditVideoApp {
             } else if close {
                 self.export_dialog = None;
             }
+        }
+        if snap {
+            self.snap_to_keyframes();
         }
 
         if let Some(running) = &mut self.export {
@@ -833,11 +1010,70 @@ impl EditVideoApp {
     }
 }
 
+/// 書き出し設定ウィンドウのキーフレーム確認欄。スナップボタンが押されたら true
+fn keyframe_section(ui: &mut egui::Ui, view: &KeyframeView) -> bool {
+    match view {
+        KeyframeView::Checking => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("キーフレームを確認中…");
+            });
+            false
+        }
+        KeyframeView::Failed(e) => {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("キーフレームを確認できませんでした: {e}"),
+            );
+            false
+        }
+        KeyframeView::Ok => {
+            ui.label("区間の開始はすべてキーフレーム上です。");
+            false
+        }
+        KeyframeView::Issues { at, snappable } => {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "区間の開始 {} か所がキーフレーム上にありません。\n\
+                     高速モードでは直前のキーフレームから書き出されるため、開始位置がずれます。",
+                    at.len()
+                ),
+            );
+            let mut list = at
+                .iter()
+                .take(MAX_LISTED_ISSUES)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("、");
+            if at.len() > MAX_LISTED_ISSUES {
+                list.push_str(&format!(" ほか {} か所", at.len() - MAX_LISTED_ISSUES));
+            }
+            ui.label(list);
+            let clicked = ui
+                .add_enabled(
+                    *snappable > 0,
+                    egui::Button::new("最寄りのキーフレームにスナップ"),
+                )
+                .on_hover_text("区間の開始を最寄りのキーフレームへ寄せます（Ctrl+Z で取り消し）")
+                .clicked();
+            if *snappable < at.len() {
+                ui.label(format!(
+                    "{} か所は区間内・直前の削除部分にキーフレームが無いため寄せられません。",
+                    at.len() - snappable
+                ));
+            }
+            clicked
+        }
+    }
+}
+
 impl eframe::App for EditVideoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_probe(&ctx);
         self.poll_export();
+        self.poll_keyframes();
         self.poll_player(&ctx);
         self.handle_keys(&ctx);
 
@@ -871,6 +1107,7 @@ impl eframe::App for EditVideoApp {
         }
 
         self.export_windows(&ctx);
+        self.ffmpeg_window(&ctx);
         // 今フレームの編集をプレイヤーへ反映する
         self.sync_player_timeline();
     }

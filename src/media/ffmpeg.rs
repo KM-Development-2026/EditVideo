@@ -4,8 +4,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Result, anyhow};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 
 /// コンソール窓を出さない（Windows の CREATE_NO_WINDOW）
 #[cfg(windows)]
@@ -19,18 +19,35 @@ pub struct FfmpegPaths {
 }
 
 /// `%APPDATA%\EditVideo\config.json` の内容
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// ffmpeg.exe のパス
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ffmpeg_path: Option<PathBuf>,
     /// ffprobe.exe のパス
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ffprobe_path: Option<PathBuf>,
 }
 
 impl Config {
     pub fn parse(json: &str) -> Result<Self> {
         Ok(serde_json::from_str(json)?)
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// 設定ファイルに保存する（フォルダが無ければ作る）
+    pub fn save(&self) -> Result<()> {
+        let path = config_path().ok_or_else(|| anyhow!("APPDATA が設定されていません"))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("{} を作成できません", dir.display()))?;
+        }
+        std::fs::write(&path, self.to_json()?)
+            .with_context(|| format!("設定ファイル {} に保存できません", path.display()))
     }
 
     /// 設定ファイルを読む。存在しなければ既定値
@@ -66,6 +83,30 @@ pub fn locate() -> Result<FfmpegPaths> {
             anyhow!("ffprobe が見つかりません。PATH に追加するか設定ファイルで指定してください")
         })?;
     Ok(FfmpegPaths { ffmpeg, ffprobe })
+}
+
+/// ffmpeg.exe と同じフォルダの ffprobe.exe
+pub fn sibling_ffprobe(ffmpeg: &Path) -> PathBuf {
+    ffmpeg.with_file_name(format!("ffprobe{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// 指定した ffmpeg.exe と、同じフォルダの ffprobe.exe を設定ファイルに保存する
+pub fn save_location(ffmpeg: &Path) -> Result<()> {
+    if !ffmpeg.is_file() {
+        bail!("{} が見つかりません", ffmpeg.display());
+    }
+    let ffprobe = sibling_ffprobe(ffmpeg);
+    if !ffprobe.is_file() {
+        bail!(
+            "ffmpeg.exe と同じフォルダに ffprobe.exe がありません: {}",
+            ffprobe.display()
+        );
+    }
+    // 読めない設定ファイルは上書きする
+    let mut config = Config::load().unwrap_or_default();
+    config.ffmpeg_path = Some(ffmpeg.to_path_buf());
+    config.ffprobe_path = Some(ffprobe);
+    config.save()
 }
 
 /// 指定パスが存在すればそれを、無ければ PATH から name を探す
@@ -106,6 +147,39 @@ mod tests {
         assert_eq!(c.ffprobe_path, None);
         assert_eq!(Config::parse("{}").unwrap(), Config::default());
         assert!(Config::parse("not json").is_err());
+    }
+
+    #[test]
+    fn config_json_roundtrip() {
+        let c = Config {
+            ffmpeg_path: Some(PathBuf::from(r"C:\ff\ffmpeg.exe")),
+            ffprobe_path: Some(PathBuf::from(r"C:\ff\ffprobe.exe")),
+        };
+        assert_eq!(Config::parse(&c.to_json().unwrap()).unwrap(), c);
+        // 未設定の項目は書き出さない
+        assert_eq!(Config::default().to_json().unwrap(), "{}");
+    }
+
+    #[test]
+    fn sibling_ffprobe_is_in_same_dir() {
+        let exe = std::env::consts::EXE_SUFFIX;
+        assert_eq!(
+            sibling_ffprobe(Path::new(&format!("C:/ff/bin/ffmpeg{exe}"))),
+            PathBuf::from(format!("C:/ff/bin/ffprobe{exe}"))
+        );
+    }
+
+    #[test]
+    fn save_location_requires_ffprobe_next_to_ffmpeg() {
+        let dir = std::env::temp_dir().join(format!("edit_video_loc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ffmpeg = dir.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
+        // 存在しない・ffprobe が無い場合は保存前にエラー（設定ファイルには触れない）
+        assert!(save_location(&ffmpeg).is_err());
+        std::fs::write(&ffmpeg, b"").unwrap();
+        let err = save_location(&ffmpeg).unwrap_err();
+        assert!(format!("{err}").contains("ffprobe"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -92,7 +92,6 @@ pub struct MediaInfo {
     pub has_audio: bool,
     pub video_codec: Option<String>, // 例: "h264"（高速モードの連結可否判定用）
     pub audio_codec: Option<String>, // 音声なしなら None
-    pub keyframes: Vec<Timestamp>, // 高速モードのスナップ・警告用（遅延取得）
 }
 
 /// 読み込んだ素材の識別子（Timeline::sources の添字）
@@ -161,7 +160,7 @@ ffmpeg -hide_banner -loglevel error -nostdin -ss <素材時刻> -i <file>
 - 読み出した n 枚目のフレームの素材時刻は `fps.frame_start(k + n)`（rawvideo 出力は既定で CFR）。
   これをセグメントのタイムライン位置に変換して UI へ渡す（UI とのやりとりはすべてタイムライン時刻）。
 - ワーカーは `Timeline` のスナップショット（clone）を持つ。UI 側でセグメント構成が変わったら `SetTimeline` で差し替え、現在位置を表示し直す。
-- `-hwaccel d3d11va` は仕上げ工程（12章6）で任意に付与する（環境で利用可能を確認済み）。
+- **ハードウェアデコードは使わない**：`-hwaccel d3d11va` を実測（Ryzen 5 5600G、960px・RGBA 出力）したところ、H.264 1080p / 4K・HEVC 4K のいずれもシーク1枚・連続デコードとも 2〜3 倍遅かった（GPU からの転送と縮小の負担が上回る）。
 
 ### コマンド / イベント
 - UI → worker（mpsc）：`Seek(t)` / `Play` / `Pause` / `StepFrame(±n)` / `SetTimeline` / `SetPreviewWidth` / `Shutdown`
@@ -206,6 +205,12 @@ rodio + `ffmpeg -f s16le pipe:1` により実装し、音声クロックをマ�
 
 高速モードでは、区間開始がキーフレームでない場合 UI で警告を出し、
 「最寄りのキーフレームにスナップ」ボタンを用意する。
+- キーフレーム位置は書き出し設定で高速モードを選んだときに別スレッドで取得する
+  （`ffprobe -select_streams V:0 -show_entries format=start_time:packet=pts_time,flags -of csv`。
+  パケットのみ読みデコードしない。`start_time` を引いて素材時刻にする）。Undo のスナップショットに含めないようアプリ側で素材ごとに保持する。
+- 判定は書き出し区間ごと。開始とフレーム番号が同じキーフレームがあれば OK（`Timeline::keyframe_issues`）。
+- スナップ（`Timeline::snap_to_keyframes`、Undo 可）：区間内または直前の削除済み部分（同じ素材で連続）にある最寄りのキーフレームへ寄せる。
+  開始が IN 点なら IN を動かす。後ろへ寄せる場合はその間を削除、前へ寄せる場合は削除済み部分を復元する。IN が削除部分の中にあるときは IN より前には寄せない。
 
 ### 正確モードのコマンド例（2区間）
 ```
@@ -336,7 +341,7 @@ ffmpeg -hide_banner
 1. 設定ファイル（`%APPDATA%\EditVideo\config.json`）で指定されたパス
 2. PATH
 
-見つからなければ起動時にダイアログで案内し、パスを指定できるようにする。サブプロセスは
+見つからなければ起動時にダイアログで案内し、パスを指定できるようにする（ffmpeg.exe を選ぶと同じフォルダの ffprobe.exe と合わせて設定ファイルに保存し、探し直す。PATH 追加後の「再検索」も可）。サブプロセスは
 `CREATE_NO_WINDOW` フラグで起動し、コンソール窓を出さない。
 
 ## 9. エラー処理

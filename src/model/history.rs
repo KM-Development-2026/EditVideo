@@ -111,7 +111,6 @@ mod tests {
             has_audio: false,
             video_codec: None,
             audio_codec: None,
-            keyframes: Vec::new(),
         });
         tl
     }

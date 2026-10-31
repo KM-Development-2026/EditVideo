@@ -106,8 +106,74 @@ pub fn parse_probe_json(path: &Path, json: &str) -> Result<MediaInfo> {
         has_audio: audio.is_some(),
         video_codec: video.codec_name.clone(),
         audio_codec: audio.and_then(|a| a.codec_name.clone()),
-        keyframes: Vec::new(),
     })
+}
+
+/// 映像のキーフレーム位置（素材時刻・昇順）を取得する。
+/// パケット情報だけを読む（デコードしない）が、ファイル全体を読むので長尺では時間がかかる
+pub fn probe_keyframes(ffprobe: &Path, file: &Path) -> Result<Vec<Timestamp>> {
+    let output = ffmpeg::command(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "V:0",
+            "-show_entries",
+            "format=start_time:packet=pts_time,flags",
+            "-of",
+            "csv",
+        ])
+        .arg(file)
+        .output()
+        .with_context(|| format!("ffprobe を起動できません: {}", ffprobe.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "キーフレームを取得できません（{}）: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    let keyframes = parse_keyframes_csv(&String::from_utf8_lossy(&output.stdout));
+    if keyframes.is_empty() {
+        bail!("キーフレームが見つかりません");
+    }
+    Ok(keyframes)
+}
+
+/// ffprobe の CSV（`packet,<pts_time>,<flags>` と `format,<start_time>`）からキーフレーム位置を得る。
+/// ffmpeg の入力シークはファイルの開始時刻を基準にするので、start_time を引いて素材時刻にする
+pub fn parse_keyframes_csv(csv: &str) -> Vec<Timestamp> {
+    let mut start = Timestamp::ZERO;
+    let mut pts = Vec::new();
+    for line in csv.lines() {
+        let mut fields = line.trim().split(',');
+        match fields.next() {
+            Some("packet") => {
+                let (Some(t), Some(flags)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                if flags.contains('K')
+                    && let Some(t) = parse_seconds(t)
+                {
+                    pts.push(t);
+                }
+            }
+            Some("format") => {
+                if let Some(t) = fields.next().and_then(parse_seconds) {
+                    start = t;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut keyframes: Vec<Timestamp> = pts
+        .into_iter()
+        .map(|t| (t - start).max(Timestamp::ZERO))
+        .collect();
+    keyframes.sort();
+    keyframes.dedup();
+    keyframes
 }
 
 /// "30000/1001" や "25" をパース
@@ -173,7 +239,28 @@ mod tests {
         assert_eq!(info.video_codec.as_deref(), Some("h264"));
         assert_eq!(info.audio_codec.as_deref(), Some("aac"));
         assert_eq!(info.duration, Timestamp(60_032_000));
-        assert!(info.keyframes.is_empty());
+    }
+
+    #[test]
+    fn parse_keyframes_subtracts_start_time() {
+        // mpegts は開始時刻が 0 でない。パケットはデコード順なので並べ替える
+        let csv = "packet,2.466667,K__,\n\
+                   packet,1.466667,K__,\n\
+                   packet,1.566667,___,\n\
+                   packet,N/A,K__,\n\
+                   packet,3.466667,K_D,\n\
+                   format,1.466667\n";
+        assert_eq!(
+            parse_keyframes_csv(csv),
+            vec![Timestamp(0), Timestamp(1_000_000), Timestamp(2_000_000)]
+        );
+        // 開始時刻が N/A なら 0 とみなす
+        let csv = "packet,0.000000,K__\npacket,0.500000,K__\nformat,N/A\n";
+        assert_eq!(
+            parse_keyframes_csv(csv),
+            vec![Timestamp(0), Timestamp(500_000)]
+        );
+        assert!(parse_keyframes_csv("").is_empty());
     }
 
     #[test]
