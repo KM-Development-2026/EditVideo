@@ -9,7 +9,7 @@ use eframe::egui;
 
 use crate::export::{ExportEvent, ExportJob, ExportMode, ExportSettings, Quality};
 use crate::media::ffmpeg::{self, FfmpegPaths};
-use crate::media::player::{PlaybackState, Player, PlayerCommand, PlayerEvent};
+use crate::media::player::{self, PlaybackState, Player, PlayerCommand, PlayerEvent};
 use crate::media::probe;
 use crate::model::history::History;
 use crate::model::timeline::{Segment, Timeline};
@@ -87,6 +87,8 @@ pub struct EditVideoApp {
     /// 表示中フレームのタイムライン時刻（再生ヘッド）
     position: Timestamp,
     playing: bool,
+    /// 再生中の倍率（プレイヤーに送った値。負なら逆再生）
+    speed: i32,
     /// シークスライダー操作中の値（秒）。フレームが届くまで表示に使う
     scrub: Option<f64>,
     scrub_dragging: bool,
@@ -126,6 +128,7 @@ impl EditVideoApp {
             preview: Preview::default(),
             position: Timestamp::ZERO,
             playing: false,
+            speed: 1,
             scrub: None,
             scrub_dragging: false,
         }
@@ -363,12 +366,22 @@ impl EditVideoApp {
         }
     }
 
-    fn toggle_play(&self) {
-        self.send_player(if self.playing {
-            PlayerCommand::Pause
+    fn toggle_play(&mut self) {
+        if self.playing {
+            self.send_player(PlayerCommand::Pause);
         } else {
-            PlayerCommand::Play
-        });
+            self.speed = 1;
+            self.send_player(PlayerCommand::Play);
+        }
+    }
+
+    /// J / L（dir = -1 / 1）。連打で段階を上げられるよう、再生状態・倍率は送った時点で更新する
+    /// （再生できなかった場合はプレイヤーから State(Paused) が届いて戻る）
+    fn shuttle(&mut self, dir: i32) {
+        let speed = player::next_shuttle_speed(self.playing.then_some(self.speed), dir);
+        self.send_player(PlayerCommand::Shuttle(speed));
+        self.speed = speed;
+        self.playing = true;
     }
 
     /// タイムライン（セグメント構成）が変わったらプレイヤーへスナップショットを送る。
@@ -393,7 +406,12 @@ impl EditVideoApp {
                     height,
                     rgba,
                 } => latest = Some((time, width, height, rgba)),
-                PlayerEvent::State(s) => self.playing = s == PlaybackState::Playing,
+                PlayerEvent::State(s) => {
+                    self.playing = s == PlaybackState::Playing;
+                    if !self.playing {
+                        self.speed = 1;
+                    }
+                }
                 PlayerEvent::Ended => self.playing = false,
                 PlayerEvent::Error(e) => self.error = Some(e),
             }
@@ -493,10 +511,9 @@ impl EditVideoApp {
         let pos = self.position;
         match action {
             Action::TogglePlay => self.toggle_play(),
-            Action::ShuttleRight => self.send_player(PlayerCommand::Play),
+            Action::ShuttleRight => self.shuttle(1),
             Action::ShuttleStop => self.send_player(PlayerCommand::Pause),
-            // 逆再生は後続ステップ
-            Action::ShuttleLeft => {}
+            Action::ShuttleLeft => self.shuttle(-1),
             Action::Step(n) => self.send_player(PlayerCommand::StepFrame(n)),
             Action::PrevEdit => {
                 if let Some(t) = self.timeline.prev_edit(pos) {
@@ -733,13 +750,24 @@ impl EditVideoApp {
         // 時刻表示は Premiere と同じく、現在時刻を再生ヘッドと同じ青、総尺を通常色で出す
         let font = egui::FontId::proportional(16.0);
         let painter = ui.painter();
-        painter.text(
+        let current = painter.text(
             row.left_center(),
             egui::Align2::LEFT_CENTER,
             self.timecode(self.display_position()),
             font.clone(),
             timeline::PLAYHEAD_COLOR,
         );
+        // シャトル中は倍率・向きを現在時刻の横に出す
+        if self.playing && self.speed != 1 {
+            let arrow = if self.speed < 0 { "◀◀" } else { "▶▶" };
+            painter.text(
+                current.right_center() + egui::vec2(10.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{arrow} {}x", self.speed.abs()),
+                egui::FontId::proportional(13.0),
+                ui.visuals().weak_text_color(),
+            );
+        }
         painter.text(
             row.right_center(),
             egui::Align2::RIGHT_CENTER,

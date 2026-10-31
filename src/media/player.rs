@@ -36,13 +36,20 @@ const FALLBACK_BACKOFF: Timestamp = Timestamp::from_secs(1);
 const MAX_FORWARD_SKIP: i64 = 15;
 /// エラーメッセージに含める stderr の行数
 const STDERR_TAIL_LINES: usize = 10;
+/// シャトルの最大倍率
+pub const MAX_SHUTTLE_SPEED: i32 = 8;
+/// 逆再生で一度にデコードする枚数（960x540 で約 60MB）
+const REVERSE_CHUNK_FRAMES: usize = 30;
 
 /// UI からワーカーへのコマンド
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerCommand {
     /// タイムライン時刻へシーク
     Seek(Timestamp),
+    /// 等速で順再生（`Shuttle(1)` と同じ）
     Play,
+    /// 倍率 speed で再生（負なら逆再生。±1〜±`MAX_SHUTTLE_SPEED`）
+    Shuttle(i32),
     Pause,
     /// ±N フレーム移動（再生中なら一時停止してから）
     StepFrame(i64),
@@ -112,6 +119,9 @@ impl Player {
             clock: None,
             drops: 0,
             unsent: None,
+            speed: 1,
+            reverse_buf: Vec::new(),
+            reverse_frame_duration: Timestamp::ZERO,
         };
         let handle = std::thread::Builder::new()
             .name("player".into())
@@ -140,6 +150,10 @@ impl Player {
 
     pub fn pause(&self) {
         self.send(PlayerCommand::Pause);
+    }
+
+    pub fn shuttle(&self, speed: i32) {
+        self.send(PlayerCommand::Shuttle(speed));
     }
 
     pub fn step_frame(&self, n: i64) {
@@ -305,8 +319,79 @@ pub fn preview_size(src_width: u32, src_height: u32, max_width: u32) -> (u32, u3
     (w, even(h as u32))
 }
 
-/// プレビュー用 ffmpeg の引数
-pub fn decode_args(file: &Path, ss: Timestamp, width: u32, height: u32) -> Vec<OsString> {
+/// 逆再生で次に読む範囲
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReverseChunk {
+    pub seg: usize,
+    /// セグメント先頭のタイムライン時刻
+    pub seg_start: Timestamp,
+    pub fps: Rational,
+    /// 最初に読む（最も古い）素材フレーム番号
+    pub first: i64,
+    /// 読む枚数（step フレームおき）
+    pub count: usize,
+}
+
+/// position に表示中のフレームより前を逆再生するときに読む範囲（step フレームおきに最大 max_count 枚）。
+/// セグメント先頭を越えるときは、削除済みを飛ばして直前の有効セグメントの末尾から。
+/// 先頭まで戻りきった・セグメントが無い場合は None
+pub fn reverse_chunk(
+    tl: &Timeline,
+    position: Timestamp,
+    step: i64,
+    max_count: usize,
+) -> Option<ReverseChunk> {
+    let step = step.max(1);
+    let plan = plan_seek(tl, position)?;
+    let mut idx = plan.seg;
+    // 読む範囲の最後（最も新しい）フレーム
+    let mut last = plan.frame - step;
+    loop {
+        let seg = &tl.segments[idx];
+        let fps = tl.source(seg.source)?.fps;
+        let first_frame = fps.frame_at(seg.start);
+        if seg.enabled && last >= first_frame {
+            let lowest = last - step * (max_count.max(1) as i64 - 1);
+            let first = if lowest >= first_frame {
+                lowest
+            } else {
+                last - (last - first_frame) / step * step
+            };
+            return Some(ReverseChunk {
+                seg: idx,
+                seg_start: tl.segment_range(idx)?.0,
+                fps,
+                first,
+                count: ((last - first) / step + 1) as usize,
+            });
+        }
+        idx = (0..idx).rev().find(|&i| tl.segments[i].enabled)?;
+        let prev = &tl.segments[idx];
+        last = tl
+            .source(prev.source)?
+            .fps
+            .frame_at(prev.end - Timestamp(1));
+    }
+}
+
+/// シャトル操作（L: dir = 1 / J: dir = -1）後の倍率。current は再生中の倍率（停止中は None）。
+/// 同じ向きに再生中なら倍に（最大 `MAX_SHUTTLE_SPEED`）、それ以外は等速
+pub fn next_shuttle_speed(current: Option<i32>, dir: i32) -> i32 {
+    let dir = if dir < 0 { -1 } else { 1 };
+    match current {
+        Some(s) if s.signum() == dir => (s * 2).clamp(-MAX_SHUTTLE_SPEED, MAX_SHUTTLE_SPEED),
+        _ => dir,
+    }
+}
+
+/// プレビュー用 ffmpeg の引数。step > 1 なら step フレームおきに間引いて出力する（倍速・逆再生用）
+pub fn decode_args(
+    file: &Path,
+    ss: Timestamp,
+    width: u32,
+    height: u32,
+    step: i64,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-ss"]
         .into_iter()
         .map(OsString::from)
@@ -317,7 +402,13 @@ pub fn decode_args(file: &Path, ss: Timestamp, width: u32, height: u32) -> Vec<O
     for a in ["-map", "0:V:0", "-an", "-sn", "-dn", "-vf"] {
         args.push(a.into());
     }
-    args.push(format!("scale={width}:{height}").into());
+    // framestep はシーク位置のフレームから数えて間引く（重複フレームも出ない。実測で確認済み）
+    let scale = format!("scale={width}:{height}");
+    args.push(if step > 1 {
+        format!("framestep={step},{scale}").into()
+    } else {
+        scale.into()
+    });
     for a in ["-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1"] {
         args.push(a.into());
     }
@@ -339,9 +430,10 @@ pub fn coalesce(cmds: impl IntoIterator<Item = PlayerCommand>) -> Vec<PlayerComm
     out
 }
 
-/// 再生開始時刻 origin から elapsed 経過したときのタイムライン時刻
-pub fn clock_time(origin: Timestamp, elapsed: Duration) -> Timestamp {
-    origin + Timestamp(elapsed.as_micros().min(i64::MAX as u128) as i64)
+/// 再生開始時刻 origin から倍率 rate（負なら逆再生）で elapsed 経過したときのタイムライン時刻
+pub fn clock_time(origin: Timestamp, elapsed: Duration, rate: i32) -> Timestamp {
+    let us = elapsed.as_micros().min(i64::MAX as u128) as i64;
+    origin + Timestamp(us.saturating_mul(i64::from(rate)))
 }
 
 /// 再生中のフレームを読み捨てるか（表示期間が過ぎている・連続読み捨てが上限未満）
@@ -364,22 +456,26 @@ struct Decoder {
     fps: Rational,
     /// 次に読むフレームの素材フレーム番号
     next_frame: i64,
+    /// 1枚読むごとに進むフレーム数（間引き）
+    step: i64,
     width: u32,
     height: u32,
 }
 
 impl Decoder {
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         ffmpeg_exe: &Path,
         info: &MediaInfo,
         plan: &SeekPlan,
         ss: Timestamp,
         frame: i64,
+        step: i64,
         max_width: u32,
     ) -> Result<Self, String> {
         let (width, height) = preview_size(info.width, info.height, max_width);
         let mut child = ffmpeg::command(ffmpeg_exe)
-            .args(decode_args(&info.path, ss, width, height))
+            .args(decode_args(&info.path, ss, width, height, step))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -397,6 +493,7 @@ impl Decoder {
             seg_start: plan.seg_start,
             fps: plan.fps,
             next_frame: frame,
+            step: step.max(1),
             width,
             height,
         })
@@ -407,7 +504,7 @@ impl Decoder {
         let mut buf = vec![0u8; self.width as usize * self.height as usize * 4];
         match self.stdout.read_exact(&mut buf) {
             Ok(()) => {
-                self.next_frame += 1;
+                self.next_frame += self.step;
                 Ok(Some(buf))
             }
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(None),
@@ -441,23 +538,54 @@ struct Unsent {
     rgba: Vec<u8>,
 }
 
-/// 再生クロック（origin_time を origin で表示した基準）
+/// 再生クロック（origin_time を origin で表示した基準。rate は倍率、負なら逆再生）
 #[derive(Clone, Copy)]
 struct Clock {
     origin: Instant,
     origin_time: Timestamp,
+    rate: i32,
 }
 
 impl Clock {
-    fn start(t: Timestamp) -> Self {
+    fn start(t: Timestamp, rate: i32) -> Self {
         Self {
             origin: Instant::now(),
             origin_time: t,
+            rate,
         }
     }
 
     fn now(&self) -> Timestamp {
-        clock_time(self.origin_time, self.origin.elapsed())
+        clock_time(self.origin_time, self.origin.elapsed(), self.rate)
+    }
+
+    /// 時刻 t のフレームの表示時刻に達したか（逆再生では時刻が減る向きに進む）
+    fn reached(&self, t: Timestamp) -> bool {
+        if self.rate < 0 {
+            t >= self.now()
+        } else {
+            t <= self.now()
+        }
+    }
+
+    /// 時刻 t に達するまでの実時間
+    fn wall_until(&self, t: Timestamp) -> Duration {
+        let us = (t - self.now()).as_micros() / i64::from(self.rate.unsigned_abs().max(1));
+        Duration::from_micros(us.unsigned_abs())
+    }
+
+    /// 時刻 t のフレームが進行方向に frame_duration 以上遅れていて読み捨てるか
+    fn should_drop(&self, t: Timestamp, frame_duration: Timestamp, drops: u32) -> bool {
+        if self.rate < 0 {
+            should_drop(
+                Timestamp(-t.0),
+                Timestamp(-self.now().0),
+                frame_duration,
+                drops,
+            )
+        } else {
+            should_drop(t, self.now(), frame_duration, drops)
+        }
     }
 }
 
@@ -479,6 +607,12 @@ struct Worker {
     /// 連続して読み捨てたフレーム数
     drops: u32,
     unsent: Option<Unsent>,
+    /// 再生倍率（負なら逆再生）。停止中は 1
+    speed: i32,
+    /// 逆再生用にデコード済みのフレーム（古い順。末尾から表示する）
+    reverse_buf: Vec<Unsent>,
+    /// reverse_buf の1枚あたりの表示期間（タイムライン時刻）
+    reverse_frame_duration: Timestamp,
 }
 
 impl Worker {
@@ -529,7 +663,8 @@ impl Worker {
                     self.show_at(t);
                 }
             }
-            PlayerCommand::Play => self.play(),
+            PlayerCommand::Play => self.shuttle(1),
+            PlayerCommand::Shuttle(s) => self.shuttle(s),
             PlayerCommand::Pause => self.pause(),
             PlayerCommand::StepFrame(n) => {
                 self.pause();
@@ -568,6 +703,10 @@ impl Worker {
     }
 
     fn set_state(&mut self, state: PlaybackState) {
+        if state == PlaybackState::Paused {
+            self.speed = 1;
+            self.reverse_buf.clear();
+        }
         if self.state != state {
             self.state = state;
             self.send(PlayerEvent::State(state));
@@ -595,6 +734,41 @@ impl Worker {
         }
     }
 
+    /// 倍率 speed で再生する（負なら逆再生）。再生中なら現在位置から倍率・向きを切り替える
+    fn shuttle(&mut self, speed: i32) {
+        let speed = speed.clamp(-MAX_SHUTTLE_SPEED, MAX_SHUTTLE_SPEED);
+        if speed == 0 {
+            return self.pause();
+        }
+        if self.state == PlaybackState::Playing {
+            if speed == self.speed {
+                return;
+            }
+            // 間引き量・向きが変わるので現在位置から読み直す
+            self.decoder = None;
+            self.reverse_buf.clear();
+            self.flush_unsent();
+            self.clock = None;
+            self.drops = 0;
+            self.speed = speed;
+            return;
+        }
+        if speed > 0 {
+            self.speed = speed;
+            return self.play();
+        }
+        // 先頭では逆再生できない（UI が再生中と見なしていても戻せるよう状態を通知する）
+        if reverse_chunk(&self.timeline, self.position, 1, 1).is_none() {
+            return self.send(PlayerEvent::State(PlaybackState::Paused));
+        }
+        self.decoder = None;
+        self.clock = None;
+        self.drops = 0;
+        self.speed = speed;
+        self.set_state(PlaybackState::Playing);
+    }
+
+    /// 順再生を始める（倍率は self.speed）
     fn play(&mut self) {
         if self.state == PlaybackState::Playing {
             return;
@@ -607,22 +781,35 @@ impl Worker {
         };
         // 末尾・有効区間なしなら先頭から
         let Some(start) = start.or_else(|| playable_from(&self.timeline, Timestamp::ZERO)) else {
-            return;
+            self.speed = 1;
+            return self.send(PlayerEvent::State(PlaybackState::Paused));
         };
-        if start != self.position {
+        let step = i64::from(self.speed);
+        if start != self.position || self.decoder.as_ref().is_some_and(|d| d.step != step) {
             self.decoder = None;
         }
         self.position = start;
         self.drops = 0;
         // プロセスを起動し直す場合は最初のフレームを読んだ時点からクロックを進める
-        self.clock = self.decoder.as_ref().map(|_| Clock::start(start));
+        self.clock = self
+            .decoder
+            .as_ref()
+            .map(|_| Clock::start(start, self.speed));
         self.set_state(PlaybackState::Playing);
     }
 
-    /// 再生中のシーク（無効セグメント内なら次の有効セグメント先頭へ）
+    /// 再生中のシーク。順再生では無効セグメント内なら次の有効セグメント先頭へ。
+    /// 逆再生では t の手前から逆再生を続ける
     fn restart_playing_at(&mut self, t: Timestamp) {
         self.decoder = None;
         self.unsent = None;
+        if self.speed < 0 {
+            self.reverse_buf.clear();
+            self.position = t;
+            self.clock = None;
+            self.drops = 0;
+            return;
+        }
         match playable_from(&self.timeline, t) {
             Some(start) => {
                 self.position = start;
@@ -640,13 +827,65 @@ impl Worker {
         }
     }
 
-    fn spawn_decoder(&self, plan: &SeekPlan, ss: Timestamp, frame: i64) -> Result<Decoder, String> {
+    fn spawn_decoder(
+        &self,
+        plan: &SeekPlan,
+        ss: Timestamp,
+        frame: i64,
+        step: i64,
+    ) -> Result<Decoder, String> {
         let seg = &self.timeline.segments[plan.seg];
         let info = self
             .timeline
             .source(seg.source)
             .ok_or_else(|| "素材が見つかりません".to_owned())?;
-        Decoder::spawn(&self.ffmpeg, info, plan, ss, frame, self.preview_width)
+        Decoder::spawn(
+            &self.ffmpeg,
+            info,
+            plan,
+            ss,
+            frame,
+            step,
+            self.preview_width,
+        )
+    }
+
+    /// 再生中、時刻 t のフレームの表示時刻まで待つ（その間もコマンドを受け付ける）。
+    /// 表示してよければ true。コマンドが届いた・まだ早い場合は false（次のループで再度呼ばれる）
+    fn wait_until_due(&mut self, t: Timestamp) -> bool {
+        let Some(clock) = self.clock else {
+            return true;
+        };
+        if clock.reached(t) {
+            return true;
+        }
+        match self.rx.recv_timeout(clock.wall_until(t).min(MAX_WAIT)) {
+            Ok(cmd) => {
+                self.pending.push_back(cmd);
+                false
+            }
+            Err(RecvTimeoutError::Timeout) => clock.reached(t),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.pending.push_back(PlayerCommand::Shutdown);
+                false
+            }
+        }
+    }
+
+    /// 読んだフレームを送る。進行方向に遅れていれば読み捨てる（停止時に最後の1枚は届ける）
+    fn present(&mut self, frame: Unsent, frame_duration: Timestamp) {
+        self.position = frame.time;
+        let clock = *self
+            .clock
+            .get_or_insert_with(|| Clock::start(frame.time, self.speed));
+        let busy = self.in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT;
+        self.unsent = Some(frame);
+        if clock.should_drop(self.position, frame_duration, self.drops) || busy {
+            self.drops += 1;
+        } else {
+            self.drops = 0;
+            self.flush_unsent();
+        }
     }
 
     /// 一時停止中のシーク: t のフレームを1枚表示する（プロセスは次の操作用に保持）
@@ -657,12 +896,13 @@ impl Worker {
         // 保持中のプロセスで少し先へ進むだけなら読み進める
         let reusable = self.decoder.as_ref().is_some_and(|d| {
             d.seg == plan.seg
+                && d.step == 1
                 && d.next_frame <= plan.frame
                 && plan.frame - d.next_frame <= MAX_FORWARD_SKIP
         });
         if !reusable {
             self.decoder = None;
-            match self.spawn_decoder(&plan, plan.ss, plan.frame) {
+            match self.spawn_decoder(&plan, plan.ss, plan.frame, 1) {
                 Ok(d) => self.decoder = Some(d),
                 Err(e) => return self.send(PlayerEvent::Error(e)),
             }
@@ -710,7 +950,7 @@ impl Worker {
         let first = (plan.frame - back).max(0);
         let half = Timestamp(plan.fps.frame_duration().as_micros() / 2);
         let ss = (plan.fps.frame_start(first) - half).max(Timestamp::ZERO);
-        let mut dec = match self.spawn_decoder(plan, ss, first) {
+        let mut dec = match self.spawn_decoder(plan, ss, first, 1) {
             Ok(d) => d,
             Err(e) => return self.send(PlayerEvent::Error(e)),
         };
@@ -750,11 +990,14 @@ impl Worker {
 
     /// 再生中の1ステップ: 次のフレームを読み、時刻が来たら送る
     fn tick(&mut self) {
+        if self.speed < 0 {
+            return self.tick_reverse();
+        }
         if self.decoder.is_none() {
             let Some(plan) = plan_seek(&self.timeline, self.position) else {
                 return self.end();
             };
-            match self.spawn_decoder(&plan, plan.ss, plan.frame) {
+            match self.spawn_decoder(&plan, plan.ss, plan.frame, i64::from(self.speed)) {
                 Ok(d) => self.decoder = Some(d),
                 Err(e) => {
                     self.send(PlayerEvent::Error(e));
@@ -767,24 +1010,10 @@ impl Worker {
         let Some(ft) = frame_time(seg, dec.seg_start, dec.fps, dec.next_frame) else {
             return self.advance_segment(false);
         };
-        let frame_duration = dec.fps.frame_duration();
-        // 表示時刻まで待つ（その間もコマンドを受け付ける）
-        if let Some(clock) = self.clock
-            && ft > clock.now()
-        {
-            let wait =
-                Duration::from_micros((ft - clock.now()).as_micros().max(0) as u64).min(MAX_WAIT);
-            match self.rx.recv_timeout(wait) {
-                Ok(cmd) => return self.pending.push_back(cmd),
-                Err(RecvTimeoutError::Timeout) => {
-                    if clock.now() < ft {
-                        return;
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return self.pending.push_back(PlayerCommand::Shutdown);
-                }
-            }
+        // 間引いている分、1枚あたりの表示期間が長い
+        let frame_duration = Timestamp(dec.fps.frame_duration().as_micros() * dec.step);
+        if !self.wait_until_due(ft) {
+            return;
         }
         let dec = self.decoder.as_mut().expect("decoder");
         let rgba = match dec.read_frame() {
@@ -804,17 +1033,83 @@ impl Worker {
             height: dec.height,
             rgba,
         };
-        self.position = ft;
-        let clock = *self.clock.get_or_insert_with(|| Clock::start(ft));
-        let busy = self.in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT;
-        if should_drop(ft, clock.now(), frame_duration, self.drops) || busy {
-            self.drops += 1;
-            self.unsent = Some(frame);
-        } else {
-            self.drops = 0;
-            self.unsent = Some(frame);
-            self.flush_unsent();
+        self.present(frame, frame_duration);
+    }
+
+    /// 逆再生の1ステップ: 手前の範囲をまとめてデコードし、新しい方から順に送る
+    fn tick_reverse(&mut self) {
+        let step = i64::from(-self.speed);
+        if self.reverse_buf.is_empty() {
+            let Some(chunk) =
+                reverse_chunk(&self.timeline, self.position, step, REVERSE_CHUNK_FRAMES)
+            else {
+                return self.end();
+            };
+            match self.decode_chunk(&chunk, step) {
+                Ok(frames) if !frames.is_empty() => {
+                    self.reverse_buf = frames;
+                    // 間引いている分、1枚あたりの表示期間が長い
+                    self.reverse_frame_duration =
+                        Timestamp(chunk.fps.frame_duration().as_micros() * step);
+                    // デコードに掛かった時間で遅れた分は取り戻さず、この範囲の先頭からクロックを合わせ直す
+                    self.clock = None;
+                    self.drops = 0;
+                }
+                Ok(_) => {
+                    // 映像が無い範囲（素材の映像が表記より短い等）は飛ばしてさらに手前へ
+                    let seg = &self.timeline.segments[chunk.seg];
+                    self.position = frame_time(seg, chunk.seg_start, chunk.fps, chunk.first)
+                        .unwrap_or(chunk.seg_start);
+                }
+                Err(e) => {
+                    self.send(PlayerEvent::Error(e));
+                    self.stop_playing();
+                }
+            }
+            // デコード中に届いたコマンドを先に処理する
+            return;
         }
+        let ft = self.reverse_buf.last().expect("not empty").time;
+        if !self.wait_until_due(ft) {
+            return;
+        }
+        let frame = self.reverse_buf.pop().expect("not empty");
+        self.present(frame, self.reverse_frame_duration);
+    }
+
+    /// 逆再生用に chunk の範囲をデコードする（古い順）
+    fn decode_chunk(&self, chunk: &ReverseChunk, step: i64) -> Result<Vec<Unsent>, String> {
+        let seg = &self.timeline.segments[chunk.seg];
+        let half = Timestamp(chunk.fps.frame_duration().as_micros() / 2);
+        let ss = (chunk.fps.frame_start(chunk.first) - half).max(Timestamp::ZERO);
+        let plan = SeekPlan {
+            seg: chunk.seg,
+            seg_start: chunk.seg_start,
+            fps: chunk.fps,
+            frame: chunk.first,
+            ss,
+            time: chunk.seg_start,
+        };
+        let mut dec = self.spawn_decoder(&plan, ss, chunk.first, step)?;
+        let mut frames = Vec::with_capacity(chunk.count);
+        for _ in 0..chunk.count {
+            let f = dec.next_frame;
+            match dec.read_frame() {
+                Ok(Some(rgba)) => {
+                    if let Some(time) = frame_time(seg, chunk.seg_start, chunk.fps, f) {
+                        frames.push(Unsent {
+                            time,
+                            width: dec.width,
+                            height: dec.height,
+                            rgba,
+                        });
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(format!("プレビューの読み込みに失敗しました: {e}")),
+            }
+        }
+        Ok(frames)
     }
 
     /// セグメント終端（または素材の終端 eof）に達したので次の有効セグメントへ進む
@@ -1040,7 +1335,7 @@ mod tests {
 
     #[test]
     fn decode_args_shape() {
-        let args = decode_args(Path::new("in.mp4"), ts(1_500_000), 640, 360);
+        let args = decode_args(Path::new("in.mp4"), ts(1_500_000), 640, 360, 1);
         let s: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1055,6 +1350,82 @@ mod tests {
         assert_eq!(s[pos("-f") + 1], "rawvideo");
         assert_eq!(s.last().unwrap(), "pipe:1");
         assert!(s.contains(&"-an".to_owned()));
+
+        // 倍速・逆再生は間引いてから縮小する
+        let args = decode_args(Path::new("in.mp4"), ts(0), 640, 360, 4);
+        let vf = args.iter().position(|a| a == "-vf").unwrap();
+        assert_eq!(args[vf + 1], "framestep=4,scale=640:360");
+    }
+
+    #[test]
+    fn shuttle_speed_doubles_in_same_direction() {
+        // 停止中は等速
+        assert_eq!(next_shuttle_speed(None, 1), 1);
+        assert_eq!(next_shuttle_speed(None, -1), -1);
+        // 同じ向きなら倍に、上限 8x
+        assert_eq!(next_shuttle_speed(Some(1), 1), 2);
+        assert_eq!(next_shuttle_speed(Some(2), 1), 4);
+        assert_eq!(next_shuttle_speed(Some(4), 1), 8);
+        assert_eq!(next_shuttle_speed(Some(8), 1), 8);
+        assert_eq!(next_shuttle_speed(Some(-4), -1), -8);
+        // 逆向きに再生中なら等速で向きを変える
+        assert_eq!(next_shuttle_speed(Some(-8), 1), 1);
+        assert_eq!(next_shuttle_speed(Some(4), -1), -1);
+    }
+
+    #[test]
+    fn reverse_chunk_reads_frames_before_position() {
+        let tl = single(10);
+        let f = |n| fps30().frame_start(n);
+        // 45 フレーム目の手前 30 枚
+        let c = reverse_chunk(&tl, f(45), 1, 30).unwrap();
+        assert_eq!((c.seg, c.first, c.count), (0, 15, 30));
+        // 先頭付近は 0 フレーム目まで
+        let c = reverse_chunk(&tl, f(10), 1, 30).unwrap();
+        assert_eq!((c.first, c.count), (0, 10));
+        // 間引き: 41, 37, ..., 1（step おき・0 未満に出ない）
+        let c = reverse_chunk(&tl, f(45), 4, 30).unwrap();
+        assert_eq!((c.first, c.count), (1, 11));
+        let c = reverse_chunk(&tl, f(45), 4, 3).unwrap();
+        assert_eq!((c.first, c.count), (33, 3));
+        // 先頭では読めない
+        assert_eq!(reverse_chunk(&tl, Timestamp::ZERO, 1, 30), None);
+        assert_eq!(
+            reverse_chunk(&Timeline::new(), Timestamp::ZERO, 1, 30),
+            None
+        );
+    }
+
+    #[test]
+    fn reverse_chunk_skips_disabled_segments() {
+        let mut tl = single(10);
+        let s = Timestamp::from_secs;
+        tl.delete_range(s(2), s(4));
+        // 4 秒（有効セグメントの先頭）の手前は削除区間を飛ばして 2 秒の直前から
+        let c = reverse_chunk(&tl, s(4), 1, 30).unwrap();
+        assert_eq!((c.seg, c.first, c.count), (0, 30, 30));
+        assert_eq!(c.seg_start, Timestamp::ZERO);
+        // 削除区間の中から始めても直前の有効セグメントへ
+        let c = reverse_chunk(&tl, s(3), 1, 30).unwrap();
+        assert_eq!((c.seg, c.first + c.count as i64 - 1), (0, 59));
+        // 先頭が削除済みならそれより前へは戻れない
+        let mut tl = single(10);
+        tl.delete_range(s(0), s(2));
+        assert_eq!(reverse_chunk(&tl, s(2), 1, 30), None);
+        assert_eq!(reverse_chunk(&tl, s(1), 1, 30), None);
+    }
+
+    #[test]
+    fn reverse_chunk_maps_reordered_segment() {
+        // タイムライン [0,6) = 素材 [4,10)、[6,10) = 素材 [0,4)
+        let mut tl = single(10);
+        tl.split_at(Timestamp::from_secs(4));
+        tl.segments.swap(0, 1);
+        let six = Timestamp::from_secs(6);
+        let c = reverse_chunk(&tl, six, 1, 30).unwrap();
+        // 1つ目のセグメントの末尾（素材の最終フレーム 299）まで
+        assert_eq!((c.seg, c.first + c.count as i64 - 1), (0, 299));
+        assert_eq!(c.seg_start, Timestamp::ZERO);
     }
 
     #[test]
@@ -1081,8 +1452,13 @@ mod tests {
 
     #[test]
     fn clock_and_drop() {
-        let t = clock_time(Timestamp::from_secs(2), Duration::from_millis(1_500));
+        let t = clock_time(Timestamp::from_secs(2), Duration::from_millis(1_500), 1);
         assert_eq!(t, ts(3_500_000));
+        // 倍速・逆再生
+        let t = clock_time(Timestamp::from_secs(2), Duration::from_millis(500), 4);
+        assert_eq!(t, ts(4_000_000));
+        let t = clock_time(Timestamp::from_secs(2), Duration::from_millis(500), -2);
+        assert_eq!(t, ts(1_000_000));
         let fd = fps30().frame_duration();
         let now = Timestamp::from_secs(1);
         // 表示期間内なら表示

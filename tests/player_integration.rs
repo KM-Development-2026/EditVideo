@@ -351,3 +351,132 @@ fn drop_while_playing_returns() {
     drop(p);
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
 }
+
+#[test]
+fn shuttle_double_speed() {
+    let Some((_dir, _tl, p)) = setup("player_2x", false) else {
+        return;
+    };
+    p.seek(Timestamp::ZERO);
+    next_frame(&p);
+    p.shuttle(2);
+    let started = Instant::now();
+    let events = collect(&p, Duration::from_millis(600), |_| false);
+    p.pause();
+    collect(&p, TIMEOUT, |e| {
+        matches!(e, PlayerEvent::State(PlaybackState::Paused))
+    });
+    let elapsed = started.elapsed();
+    let times = frame_times(&events);
+    eprintln!("2x 再生 {:?}: {}", elapsed, fmt_times(&times));
+    assert!(
+        times.windows(2).all(|w| w[0] < w[1]),
+        "時刻が単調増加しない"
+    );
+    // 2 フレームおきに間引いている
+    let fd = fps30().frame_duration();
+    assert!(
+        times
+            .windows(2)
+            .all(|w| w[1] - w[0] >= fd + fd - Timestamp(2)),
+        "間引かれていない"
+    );
+    // 実時間の約 2 倍進む（起動の遅れを見込んで下限は緩め）
+    let last = *times.last().expect("再生中のフレームがない");
+    assert!(last >= ms(700) && last <= ms(1_800), "{last:?}");
+}
+
+#[test]
+fn shuttle_reverse_to_start() {
+    let Some((_dir, _tl, p)) = setup("player_reverse", false) else {
+        return;
+    };
+    p.seek(ms(1_500));
+    assert_eq!(next_frame(&p).time, ms(1_500));
+    p.shuttle(-1);
+    let events = collect(&p, TIMEOUT, |e| {
+        matches!(e, PlayerEvent::State(PlaybackState::Paused))
+    });
+    let times = frame_times(&events);
+    eprintln!("逆再生: {}", fmt_times(&times));
+    assert_eq!(
+        events.first(),
+        Some(&PlayerEvent::State(PlaybackState::Playing))
+    );
+    assert!(events.contains(&PlayerEvent::Ended), "先頭で止まらない");
+    assert!(
+        times.windows(2).all(|w| w[0] > w[1]),
+        "時刻が単調減少しない"
+    );
+    assert!(
+        times.first().is_some_and(|&t| t < ms(1_500)),
+        "現在フレームより前から始まらない"
+    );
+    assert_eq!(
+        times.last(),
+        Some(&Timestamp::ZERO),
+        "先頭のフレームを表示していない"
+    );
+
+    // 先頭で逆再生しても再生状態にならない（停止状態を通知する）
+    p.shuttle(-1);
+    let again = collect(&p, Duration::from_millis(300), |_| false);
+    assert_eq!(again, vec![PlayerEvent::State(PlaybackState::Paused)]);
+}
+
+#[test]
+fn shuttle_reverse_skips_disabled_segment() {
+    let Some((_dir, mut tl, p)) = setup("player_reverse_skip", false) else {
+        return;
+    };
+    tl.delete_range(ms(1_000), ms(2_500));
+    p.set_timeline(tl);
+    next_frame(&p);
+    p.seek(ms(3_000));
+    assert_eq!(next_frame(&p).time, ms(3_000));
+    p.shuttle(-4);
+    let events = collect(&p, TIMEOUT, |e| {
+        matches!(e, PlayerEvent::State(PlaybackState::Paused))
+    });
+    let times = frame_times(&events);
+    eprintln!(
+        "無効区間 [1.0, 2.5) を含む 4x 逆再生: {}",
+        fmt_times(&times)
+    );
+    assert!(events.contains(&PlayerEvent::Ended));
+    assert!(
+        times.windows(2).all(|w| w[0] > w[1]),
+        "時刻が単調減少しない"
+    );
+    assert!(
+        times.iter().all(|&t| t < ms(1_000) || t >= ms(2_500)),
+        "無効区間のフレームが表示された"
+    );
+    assert!(times.iter().any(|&t| t >= ms(2_500)));
+    assert!(
+        times.iter().any(|&t| t < ms(1_000)),
+        "直前の有効区間へ移っていない"
+    );
+}
+
+#[test]
+fn shuttle_switches_direction_while_playing() {
+    let Some((_dir, _tl, p)) = setup("player_switch", false) else {
+        return;
+    };
+    p.seek(ms(1_000));
+    next_frame(&p);
+    p.shuttle(1);
+    let forward = frame_times(&collect(&p, Duration::from_millis(400), |_| false));
+    p.shuttle(-2);
+    let backward = collect(&p, Duration::from_millis(600), |_| false);
+    p.pause();
+    let backward = frame_times(&backward);
+    eprintln!("順 {} / 逆 {}", fmt_times(&forward), fmt_times(&backward));
+    let turn = *forward.last().expect("順再生のフレームがない");
+    assert!(turn > ms(1_000));
+    // 切り替え直後に溜まっていた順方向の1枚が届くことがあるので、それ以降で判定
+    let back: Vec<_> = backward.into_iter().skip_while(|&t| t >= turn).collect();
+    assert!(back.len() >= 3, "逆再生のフレームが少ない");
+    assert!(back.windows(2).all(|w| w[0] > w[1]), "時刻が単調減少しない");
+}
